@@ -1,4 +1,4 @@
-"""Byte-level BPE with exact GPT-2 pretokenization and incremental input."""
+"""字节级 BPE：采用 GPT-2 预分词规则，支持完整文本与流式输入。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _STREAM_CACHE_CAPACITY = 2048
 
 
 class _DescendingPair(tuple):
-    """Make heapq prefer the lexicographically largest bytes pair on ties."""
+    """频次相同时，让最小堆优先取出字节元组字典序最大的符号对。"""
 
     def __lt__(self, other):
         return tuple.__gt__(self, other)
@@ -57,7 +57,7 @@ class BPE:
         self._cache: dict[str, tuple[int, ...]] = {}
 
     def _pieces(self, text):
-        """Yield (special, start, end), isolating specials before regex matching."""
+        """先隔离特殊 token，再匹配普通文本；返回特殊标志及起止位置。"""
         offset = 0
         if self._special_re:
             for special in self._special_re.finditer(text):
@@ -73,7 +73,7 @@ class BPE:
         for chunk in iterable:
             if not isinstance(chunk, str):
                 raise TypeError("Input chunks must be strings")
-            # Bound temporary storage even if the caller supplies very large chunks.
+            # 即使调用方传入很大的文本块，也限制单次处理的临时存储。
             for start in range(0, len(chunk), 65536):
                 buffer += chunk[start : start + 65536]
                 safe_end = len(buffer)
@@ -82,10 +82,9 @@ class BPE:
                         safe_end = len(buffer) - size
                 pending = deque()
                 consumed = 0
-                # Retain three matches: extending input can change trailing whitespace
-                # and an unfinished contraction (apostrophe followed by letters).
-                # An incomplete special may also change the preceding whitespace
-                # match, so tokenize only the prefix before it.
+                # 保留末尾三个匹配：追加文本可能改变尾部空白和未完成的缩写。
+                # 未完成的特殊 token 也会影响前面的空白匹配，
+                # 因此只对它之前的确定前缀进行预分词。
                 for piece in self._pieces(buffer[:safe_end]):
                     pending.append(piece)
                     if len(pending) > 3:
@@ -176,7 +175,7 @@ class BPE:
         return self._encode_uncached(piece, _STREAM_CACHE_CAPACITY)
 
     def _encode_uncached(self, piece, cache_capacity=CACHE_CAPACITY):
-        """Apply merge ranks to a cache miss, then store eligible results."""
+        """缓存未命中时按训练得到的合并优先级编码，并缓存符合长度限制的结果。"""
         symbols = [_BYTES[b] for b in piece.encode("utf-8")]
         while len(symbols) > 1:
             best = None
@@ -198,7 +197,7 @@ class BPE:
                     index += 1
             symbols = result
         ids = tuple(self._ids[symbol] for symbol in symbols)
-        # A small bounded cache also respects the official streaming memory test.
+        # 仅缓存较短片段；达到容量后整体清空，防止缓存无限增长。
         if len(piece) <= 128:
             if len(self._cache) >= cache_capacity:
                 self._cache.clear()
@@ -228,8 +227,7 @@ class BPE:
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        # The streaming API keeps its working memory small, using the same
-        # clear-all cache logic with a private bound rather than a policy switch.
+        # 流式接口沿用满后清空的逻辑，以较小的内部容量限制工作内存。
         if len(self._cache) > _STREAM_CACHE_CAPACITY:
             self._cache.clear()
         for special, piece in self._stream_pieces(iterable):
@@ -270,7 +268,7 @@ class BPE:
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
-        """Read this implementation's hex JSON files; config is loaded by load()."""
+        """读取本实现的十六进制 JSON 文件；完整配置由 load() 恢复。"""
         vocab = json.loads(Path(vocab_filepath).read_text(encoding="utf-8"))
         merges = json.loads(Path(merges_filepath).read_text(encoding="utf-8"))
         return cls(
