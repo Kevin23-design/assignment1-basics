@@ -36,6 +36,8 @@ RESUME_KEYS = (
     "max_grad_norm",
     "precision",
     "seed",
+    "optimizer_betas",
+    "optimizer_eps",
 )
 
 
@@ -99,19 +101,23 @@ def validation_batches(tokens, context_length, batch_size, device):
 
 @torch.no_grad()
 def evaluate(model, tokens, context_length, batch_size, device, precision="fp32", deadline=math.inf):
+    was_training = model.training
     model.eval()
     total = torch.zeros((), dtype=torch.float64, device=device)
     count = 0
-    for x, y, mask in validation_batches(tokens, context_length, batch_size, device):
+    try:
+        for x, y, mask in validation_batches(tokens, context_length, batch_size, device):
+            check_deadline(deadline)
+            with autocast_context(device, precision):
+                losses = cross_entropy(model(x), y, reduction="none")
+            total.add_(losses.masked_select(mask).double().sum())
+            # 数量由数据长度确定，避免逐批将 GPU 上的 mask 求和取回 CPU。
+            count += min(x.numel(), len(tokens) - 1 - count)
+        synchronize(device)
         check_deadline(deadline)
-        with autocast_context(device, precision):
-            losses = cross_entropy(model(x), y, reduction="none")
-        total.add_(losses.masked_select(mask).double().sum())
-        # 数量由数据长度确定，避免逐批将 GPU 上的 mask 求和取回 CPU。
-        count += min(x.numel(), len(tokens) - 1 - count)
-    synchronize(device)
-    check_deadline(deadline)
-    return total.item(), count
+        return total.item(), count
+    finally:
+        model.train(was_training)
 
 
 @torch.no_grad()
@@ -160,9 +166,20 @@ def train_model(config, run):
             "inserted_special_tokens": False,
         }
     )
-    # 编码纳入本次预算；续训也重新编码原文，避免使用来源不明的缓存。
+    # 正式路径始终编码完整原文，编码与续训的耗时都计入累计预算。
     train, identity["train_sha256"] = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
     valid, identity["valid_sha256"] = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
+    run.config.update({"train_token_count": len(train), "valid_token_count": len(valid)})
+    (out / "config.json").write_text(
+        json.dumps({k: v for k, v in config.items() if k != "deadline_clock"}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    def emit(metrics):
+        run.log(metrics)
+        with (out / "metrics.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps(metrics, ensure_ascii=False, allow_nan=False) + "\n")
+
     if len(train) <= config["context_length"]:
         raise ValueError("训练数据长度必须超过上下文长度")
     run.config.update(identity)
@@ -170,7 +187,13 @@ def train_model(config, run):
     torch.manual_seed(config["seed"])
     rng = np.random.default_rng(config["seed"])
     model = TransformerLM(len(bpe.vocab), **{k: config[k] for k in MODEL_KEYS}, device=device)
-    optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        betas=tuple(config["optimizer_betas"]),
+        eps=config["optimizer_eps"],
+    )
     step = 0
     if config.get("resume"):
         # 仅恢复自己保存且可信的本地检查点，其中包含 NumPy 随机数状态。
@@ -179,7 +202,7 @@ def train_model(config, run):
             raise ValueError("续训数据或 BPE 与原运行不一致")
         if saved["run_id"] != config["resume_from_run"]:
             raise ValueError("resume_from_run 与检查点来源不一致")
-        if any(saved["config"][key] != config[key] for key in RESUME_KEYS):
+        if any(saved["config"].get(key) != config.get(key) for key in RESUME_KEYS):
             raise ValueError("续训模型、优化器、采样或调度配置与原运行不一致")
         receipt_path = Path(config["resume"]).parent / "timing.json"
         if not receipt_path.is_file():
@@ -204,6 +227,8 @@ def train_model(config, run):
     log_tokens = torch.zeros((), device=device, dtype=torch.int64)
     interval_steps = 0
     last_step_seconds = 0.0
+    tokens_per_step = config["batch_size"] * config["context_length"] * config["gradient_accumulation"]
+    target_steps = config["max_steps"]
 
     def log_interval():
         nonlocal interval_steps
@@ -211,10 +236,12 @@ def train_model(config, run):
         if count:
             if not math.isfinite(nll) or nll < 0:
                 raise ValueError("训练损失异常")
-            run.log(
+            emit(
                 {
                     "train/step": step,
                     "train/ppl": math.exp(nll / count),
+                    "train/tokens": step * tokens_per_step,
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
                     "time/elapsed_seconds": config["previous_elapsed_seconds"]
                     + time.perf_counter()
                     - PROGRAM_STARTED_CLOCK,
@@ -224,7 +251,7 @@ def train_model(config, run):
             log_tokens.zero_()
         interval_steps = 0
 
-    while config["max_steps"] is None or step < config["max_steps"]:
+    while target_steps is None or step < target_steps:
         if time.perf_counter() + reserve + 2 * last_step_seconds >= deadline:
             break
         started = time.perf_counter()
@@ -261,7 +288,7 @@ def train_model(config, run):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "iteration": step,
-            "config": {k: config[k] for k in RESUME_KEYS},
+            "config": {k: config.get(k) for k in RESUME_KEYS},
             "identity": identity,
             "run_id": run.id,
             "numpy_rng": rng.bit_generator.state,
@@ -275,25 +302,27 @@ def train_model(config, run):
         model, valid, config["context_length"], config["eval_batch_size"], device, config["precision"], deadline
     )
     synchronize(device)
-    return {"val_nll_sum": nll, "val_token_count": count, "step": step}
+    return {"val_nll_sum": nll, "val_token_count": count, "step": step, "training_tokens": step * tokens_per_step}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="手写 Transformer 训练与全量验证，累计预算最多六小时")
     parser.add_argument("--train-file", default=str(ROOT / "data/owt_train.txt"))
     parser.add_argument("--valid-file", default=str(ROOT / "data/owt_valid.txt"))
-    parser.add_argument("--bpe-prefix", required=True, help="任务一保存的分词器路径前缀")
+    parser.add_argument(
+        "--bpe-prefix", default=str(ROOT / "outputs/830f59c92e15/tokenizer"), help="任务一保存的本人分词器路径前缀"
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     for name, default in (
-        ("context-length", 256),
+        ("context-length", 512),
         ("d-model", 512),
-        ("num-layers", 8),
+        ("num-layers", 4),
         ("num-heads", 8),
         ("d-ff", 1408),
-        ("batch-size", 8),
-        ("eval-batch-size", 8),
-        ("gradient-accumulation", 4),
+        ("batch-size", 64),
+        ("eval-batch-size", 16),
+        ("gradient-accumulation", 1),
         ("warmup-steps", 200),
         ("cosine-steps", 20000),
         ("seed", 42),
@@ -305,17 +334,27 @@ def parse_args():
         ("min-learning-rate", 3e-5),
         ("weight-decay", 0.1),
         ("max-grad-norm", 1.0),
-        ("reserve-seconds", 1200),
+        ("reserve-seconds", 120),
         ("save-reserve-seconds", 120),
         ("previous-elapsed-seconds", 0),
     ):
         parser.add_argument("--" + name, type=float, default=default)
-    parser.add_argument("--max-steps", type=int, help="可选的总更新次数上限，供调试使用")
+    parser.add_argument(
+        "--max-train-seconds",
+        type=float,
+        default=BUDGET_SECONDS,
+        help="累计墙钟预算，包含编码、训练、保存及验证；最多 21600 秒",
+    )
+    parser.add_argument("--max-steps", type=int, help="可选更新次数上限；默认按剩余预算停止")
     parser.add_argument("--resume", help="本地 last.pt 路径，需同时提供累计耗时及原 run ID")
     parser.add_argument("--resume-from-run")
     config = vars(parser.parse_args())
+    budget = config["max_train_seconds"]
+    if not math.isfinite(budget) or not 0 < budget <= BUDGET_SECONDS:
+        parser.error("累计预算须在 0 到 21600 秒之间")
+    config.update(optimizer_betas=[0.9, 0.999], optimizer_eps=1e-8)
     previous = config["previous_elapsed_seconds"]
-    if not math.isfinite(previous) or not 0 <= previous < BUDGET_SECONDS:
+    if not math.isfinite(previous) or not 0 <= previous < budget:
         parser.error("此前累计耗时无效或已经用完预算")
     if bool(config["resume"]) != bool(config["resume_from_run"]) or bool(config["resume"]) != (previous > 0):
         parser.error("续训须同时提供 resume、resume-from-run 和非零 previous-elapsed-seconds")
@@ -348,7 +387,6 @@ def parse_args():
     get_lr_cosine_schedule(
         0, config["learning_rate"], config["min_learning_rate"], config["warmup_steps"], config["cosine_steps"]
     )
-    config["max_train_seconds"] = BUDGET_SECONDS
     return config
 
 
@@ -357,8 +395,8 @@ def main():
     previous = config["previous_elapsed_seconds"]
     with experiment("transformer", config, root=ROOT) as run:
         run.define_metric("train/step")
-        run.define_metric("train/ppl", step_metric="train/step")
-        config["deadline_clock"] = PROGRAM_STARTED_CLOCK + BUDGET_SECONDS - previous
+        run.define_metric("train/*", step_metric="train/step")
+        config["deadline_clock"] = PROGRAM_STARTED_CLOCK + config["max_train_seconds"] - previous
         out = ROOT / "outputs" / run.id
         out.mkdir(parents=True, exist_ok=True)
         try:
@@ -378,6 +416,7 @@ def main():
                     "time/total_seconds": total,
                     "time/difference_from_6h_seconds": total - BUDGET_SECONDS,
                     "time/within_6h": total <= BUDGET_SECONDS,
+                    "time/within_requested_budget": total <= config["max_train_seconds"],
                 }
                 run.summary.update(timing)
                 (out / "timing.json").write_text(json.dumps({"run_id": run.id, **timing}, indent=2), encoding="utf-8")
@@ -391,16 +430,18 @@ def main():
         if not math.isfinite(ppl):
             raise ValueError("验证 PPL 非有限值")
         final = {
+            "run_id": run.id,
             "val/ppl": ppl,
             "val/token_count": result["val_token_count"],
+            "train/tokens": result["training_tokens"],
             "train/final_step": result["step"],
             "train/total_seconds": total,
         }
         run.summary.update(final)
         (out / "result.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
         print(json.dumps(final, ensure_ascii=False), flush=True)
-        if total > BUDGET_SECONDS:
-            raise TimeoutError("累计耗时超过六小时预算")
+        if total > config["max_train_seconds"]:
+            raise TimeoutError("累计耗时超过本次设定的预算")
 
 
 if __name__ == "__main__":
