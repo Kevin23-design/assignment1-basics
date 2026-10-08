@@ -1,185 +1,110 @@
-# CS336 Spring 2025 Assignment 1: Basics
+# BPE 与 Transformer 作业
 
-For a full description of the assignment, see the assignment handout at
-[cs336_assignment1_basics.pdf](./cs336_assignment1_basics.pdf)
+只保留正式实验所需的实现，单入口启动，不需要开发数据准备或实验编排脚本。
 
-If you see any issues with the assignment handout or code, please feel free to
-raise a GitHub issue or open a pull request with a fix.
+| 文件 | 用途 |
+|---|---|
+| `bpe.py` | 自己的字节级 BPE：训练、编码、解码、流式接口和保存加载 |
+| `train_bpe.py` | 任务一训练与完整验证测速、前 200 个 token 展示 |
+| `transformer_module.py` | 手写 Transformer、交叉熵、AdamW、学习率、梯度裁剪与采样 |
+| `transformer_main.py` | 任务二唯一入口：完整编码、训练、保存恢复、完整验证和计时 |
+| `wandb_record.py` | 保持课程提供的源码记录器不变 |
 
-## Setup
+官方测试、适配器和环境文件保留。历史 `outputs/`、`wandb/`、已训练分词器和数据不删除；
+这些是实验产物，不是当前运行依赖的开发分支。源码快照保留供历史实验复查。
 
-### Environment
-We manage our environments with `uv` to ensure reproducibility, portability, and ease of use.
-Install `uv` [here](https://github.com/astral-sh/uv#installation) (recommended), or run `pip install uv`/`brew install uv`.
-We recommend reading a bit about managing projects in `uv` [here](https://docs.astral.sh/uv/guides/projects/#managing-dependencies) (you will not regret it!).
-
-You can now run any code in the repo using
-```sh
-uv run <python_file_path>
-```
-and the environment will be automatically solved and activated when necessary.
-
-### Run unit tests
-
+## 环境与 W&B
 
 ```sh
-uv run pytest
-```
-
-BPE tests are connected through [tests/adapters.py](./tests/adapters.py).
-The remaining Transformer adapters are still to be implemented, so running the
-entire suite is not expected to pass yet. Use the focused BPE command below.
-
-### Download data
-Download the TinyStories data and a subsample of OpenWebText
-
-``` sh
-mkdir -p data
-cd data
-
-wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
-wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
-
-wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz
-gunzip owt_train.txt.gz
-wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_valid.txt.gz
-gunzip owt_valid.txt.gz
-
-cd ..
-```
-
-
-## Course byte-level BPE
-
-`bpe.py` implements the course `BPE` interface. Run the focused tests with:
-
-```sh
-uv run pytest tests/test_train_bpe.py tests/test_tokenizer.py
-```
-
-Train and evaluate on the local OWT files (this starts a W&B run):
-
-```sh
-export WANDB_ENTITY="your-account-or-team"
-export STUDENT_ID="your-student-id"
+uv python pin 3.13
+uv sync --locked
+uv run wandb login
+export WANDB_ENTITY="你的实际账号或团队"
 export WANDB_PROJECT="lmfs-assignment1"
-uv run python train_bpe.py
+export STUDENT_ID="你的学号"
+export WANDB_MODE="online"
+export PYTHONIOENCODING="utf-8"
 ```
 
-The defaults are `data/owt_train.txt`, `data/owt_valid.txt`, a 32,000-entry
-vocabulary, and `--special-tokens '<|endoftext|>'`. Special tokens are recognized
-literally; they are not automatically inserted. Pass `--special-tokens` with no
-values for an empty list. A small local smoke run without uploading anything is:
+网络不可用时设 `WANDB_MODE=offline`，之后用 `uv run wandb sync <离线run目录>` 同步。
+提交前确认助教有权限查看两个正式运行。
 
-```sh
-WANDB_MODE=offline uv run python train_bpe.py --train-file tests/fixtures/corpus.en --valid-file tests/fixtures/corpus.en --vocab-size 500
-```
+## 运行
 
-The run writes `outputs/<run-id>/tokenizer.{vocab,merges,config}.json`.
-Vocabulary bytes and merge components use hexadecimal strings. `load(prefix)`
-restores the configuration and special IDs; `from_files(vocab_path, merges_path,
-special_tokens)` reads these hex JSON files with an explicitly supplied special
-list. It does not read GPT-2's byte-to-Unicode JSON/text format.
-
-Evaluation loads a fresh tokenizer, reads text with `newline=""`, then times
-only encoding, decoding, and equality comparison. Tables and source recording
-are outside that interval. Use the course-provided `wandb_record.py` unchanged.
-`WANDB_ENTITY` and `STUDENT_ID` are required even for offline runs;
-`WANDB_PROJECT` defaults to `lmfs-assignment1`. Set `WANDB_MODE=offline`
-to record locally for later synchronization with `uv run wandb sync <run-dir>`.
-Do not submit debugging runs as formal OWT results.
-
-The recorder prints numbered source lines with SHA256 hashes and saves the
-source snapshot and `source_dump.txt` in `outputs/<run-id>/`. It uploads a
-`source-code` artifact and checks for source changes when the experiment exits.
-The training entry point explicitly passes the project root, so source discovery
-and default data/output paths do not depend on the current working directory.
-Custom data paths are interpreted relative to the current working directory.
-
-Training reads bounded text chunks and maintains counts over distinct
-pretokens, plus an inverted pair index. Its memory use still scales with the
-number of distinct pretokens and pairs. Streaming encoding retains unresolved
-suffixes across chunks, including special-token prefixes. An arbitrarily long
-unfinished pretoken can require a correspondingly long buffer. Encoding caches
-are bounded and reset when training or loading a tokenizer.
-
-### Fixed validation cache
-
-Full-text encoding uses only a 1,048,576-entry dictionary cache, cleared when
-full. There are no cache-policy or capacity options. Run the formal entry with:
+任务一：默认完整读取 `data/owt_train.txt`、`data/owt_valid.txt`，词表上限 32,000，
+特殊标记为 `<|endoftext|>`。可用 `--train-file`、`--valid-file` 指定课程公共路径。
 
 ```sh
 uv run python train_bpe.py
 ```
 
-Loading a tokenizer starts with an empty cache and needs no extra configuration.
-The entry point records the fixed policy and capacity in W&B config. Streaming
-encoding uses the same clear-all logic with a private 2,048-entry working-memory
-bound; it is not an alternative full-text configuration.
+任务二：在 A100/A800 80GB 上，从零初始化训练，唯一启动入口为：
 
-## 实验二：手写 Transformer
+```sh
+uv run python transformer_main.py
+```
 
-核心实现位于 `transformer_module.py`，训练入口为 `transformer_main.py`。
-包括无偏置 Linear、Embedding、RMSNorm、SiLU/SwiGLU、RoPE、因果多头注意力、
-Pre-norm Transformer、稳定交叉熵、AdamW、余弦学习率和全局梯度裁剪。
-官方测试通过 `tests/adapters.py` 调用这些实现，测试预期未修改。
+默认使用现有本人分词器 `outputs/830f59c92e15/tokenizer`。迁移服务器时，需要带上
+该前缀对应的 `.vocab.json`、`.merges.json`、`.config.json`，并准备完整原始 OWT 文件。
+这是单入口，不是无需依赖的独立 Python 文件。公共路径不同可显式指定：
+
+```sh
+uv run python transformer_main.py \
+  --train-file /data/nlp_course/1-basic-data/owt_train.txt \
+  --valid-file /data/nlp_course/1-basic-data/owt_valid.txt \
+  --bpe-prefix outputs/830f59c92e15/tokenizer
+```
+
+默认模型：4 层、512 维、8 头、FFN 1408、上下文 512、BF16。
+微批次 64、梯度累积 1，即每次更新 32,768 token；这是面向 80GB 卡的候选配置，尚未实测。
+本地 4080 SUPER 若要保持相同有效 batch，可覆盖为 `--batch-size 16 --gradient-accumulation 4`。
+AdamW β=(0.9,0.999)、ε=1e-8、权重衰减 0.1、梯度裁剪 1.0。
+学习率默认 3e-4→3e-5，warmup 200 步，余弦终点 20,000 步，种子 42。
+调度参数是待校准起点，不是已验证的最优配置；在 A100 上测得吞吐后再确定余弦终点。
+默认不限制总步数，按剩余时间收尾；超过余弦终点后保持最低学习率。
+
+学习率对照只需改 `--learning-rate 1e-3`，其余条件应相同；可用 `--max-steps` 限制短程更新数。
+没有自动启动任何对照实验。所有运行仍读取指定文件全文，没有字符截断或开发清单接口。
+
+## 与作业功能要求核对
+
+| 要求 | 当前行为 |
+|---|---|
+| 本人 32k BPE | 加载自己的词表、merges、特殊标记；模型使用实际词表大小 |
+| BPE 正确性与测速 | UTF-8、保留空白；新实例全文 encode/decode/比较；展示在计时外 |
+| BPE 保存和流式接口 | 保留；全文编码缓存固定 1,048,576 项，满后清空；流式内部容量维持原实现 |
+| 手写组件 | Linear/Embedding/RMSNorm/SwiGLU/RoPE/注意力/交叉熵/AdamW/调度/裁剪均为原手写实现 |
+| 完整 OWT 训练 | 启动后用本人 BPE 编码原文，保存磁盘数组，从整个数组随机抽连续窗口 |
+| 不额外插入特殊标记 | 保留原始文本及原标记，不插入 BOS/EOS/PAD |
+| 六小时累计预算 | 最顶部开始计时，包含导入、W&B、源码、编码、初始化、训练、保存和最终验证 |
+| 为完整验证留时间 | 测量少量验证批次，按全文规模估计并留安全余量；超时明确报错 |
+| 最后模型评分 | 仅保存本地 `last.pt`，随后对该模型验证，不选择历史最佳检查点 |
+| 完整验证 PPL | eval/no_grad；总目标 NLL 除以目标总数再取 exp；覆盖尾部，仅首 token 无预测目标 |
+| 低频训练日志 | 每 100 次更新记录区间 PPL，末尾不足 100 步也记录；设备上累计日志损失 |
+| W&B 源码与评分 | 自动打印、快照并上传源码；记录最终 `val/ppl`、有效目标数、步数、UTC 时间及累计耗时 |
+| 保存恢复 | 模型、优化器、步数、随机状态、数据和分词器指纹；续训不得重置预算 |
+
+原来独立开发准备的 27.27 亿 token 缓存不直接作为免计时的正式输入。
+正式路径重新编码完整原文，数据规模以此次准确编码数量为准。完整编码耗时占用六小时预算。
+验证必须用完整 `owt_valid.txt`；此前 64.75 是验证前缀的开发成绩，不能当作正式成绩。
+W&B 最后汇总同步和进程退出不计入课程计算预算；模型权重只保存在本地。
+
+续训时沿用原配置，并追加以下参数：
+
+```sh
+--resume outputs/<原run_id>/last.pt \
+--resume-from-run <原run_id> \
+--previous-elapsed-seconds <原timing.json记录的累计秒数>
+```
+
+会核对来源、配置、数据与实际累计耗时。旧开发分支检查点不用于这条正式路径。
+
+## 测试与提交
 
 ```sh
 uv run pytest
 ```
 
-沿用任务一已经训练的分词器；`--bpe-prefix` 是实际保存路径前缀，不包含文件后缀。
-下面是当前项目产物对应的运行示例，正式训练前可调整模型与批次配置：
-
-```sh
-uv run python transformer_main.py \
-  --bpe-prefix outputs/348a7e489d53/tokenizer \
-  --device cuda --precision bf16
-```
-
-W&B 环境变量与任务一相同。默认读取完整 `data/owt_train.txt`、`data/owt_valid.txt`，
-使用分词器实际词表大小，保持其特殊 token 配置，不额外插入 BOS/EOS/PAD。
-所有模型权重随机初始化。默认模型为 8 层、512 维、8 个头、1408 维前馈层，
-上下文 256；训练微批次 8、累积 4 次梯度。默认超参数是起点，尚未经过正式六小时训练调优。
-
-无需上传的小规模 CUDA 验证（使用同一份正式分词器，文本是测试样本）：
-
-```sh
-WANDB_MODE=disabled WANDB_ENTITY=local STUDENT_ID=smoke \
-uv run python transformer_main.py \
-  --bpe-prefix outputs/348a7e489d53/tokenizer \
-  --train-file tests/fixtures/corpus.en --valid-file tests/fixtures/corpus.en \
-  --device cuda --precision bf16 \
-  --d-model 32 --num-layers 1 --num-heads 4 --d-ff 64 \
-  --context-length 32 --batch-size 2 --eval-batch-size 4 \
-  --gradient-accumulation 2 --warmup-steps 0 --max-steps 5
-```
-
-`--max-steps` 是累计更新次数上限；省略时按剩余预算停止训练。
-每 100 次参数更新记录区间训练 PPL，末尾不足 100 步的区间也记录。
-计时从入口导入 PyTorch 之前开始，包含源码记录、数据编码、初始化、训练、保存和全量验证。
-默认至少预留 1200 秒；程序还会实测少量验证批次，根据全量验证耗时估计扩大预留。
-预留是估计，超时会报错并标记 `time/within_6h=false`，不会把不完整验证当作评分结果。
-
-训练与验证文本通过本人 BPE 的流式接口编码，保持跨读取块的分词边界，
-编码结果保存为本地磁盘数组，避免一次性把完整 OWT token 列表放入内存。
-每次运行（含续训）重新编码，耗时均计入预算。
-验证按不重叠的上下文窗口覆盖全部目标位置；仅全文件首 token 没有前文，不计为目标。
-窗口内使用因果注意力，尾部不足一个窗口的 token 仍计分；组批补位不计损失。
-最终 PPL 为 `exp(全验证集 NLL 总和 / 有效目标 token 数)`。
-
-本地 `outputs/<run-id>/` 保存 `last.pt`、`timing.json`、`result.json`、
-数据哈希及 token 数组，以及记录器生成的源码快照。检查点包含模型、优化器、
-更新次数和随机数状态；只保存最后模型，随后对该模型验证，不上传模型文件。
-
-续训需保留原运行的 `last.pt` 和同目录 `timing.json`，沿用原模型、优化器、
-学习率调度和采样配置。例如在原命令末尾追加：
-
-```sh
---resume outputs/<原run-id>/last.pt \
---resume-from-run <原run-id> \
---previous-elapsed-seconds <原timing.json中的time/total_seconds>
-```
-
-续训检查 BPE、原始数据哈希和配置一致性，恢复随机数状态；累计预算不会重置。
-调试结果仅用于验证代码，不作为正式 OWT 评分结果。
+官方测试通过 `tests/adapters.py` 对接，未修改测试预期；另保留正式入口的少量回归测试。
+最终提交一份 Markdown 文档，填写姓名、学号及 BPE、Transformer 的正式 W&B 链接；
+如有续训，附关联运行。正式六小时实验与 A100 吞吐校准尚未执行，不能把开发成绩冒充正式成绩。
