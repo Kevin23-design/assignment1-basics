@@ -13,8 +13,8 @@ import regex
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 _PRETOKEN = regex.compile(PAT)
 _BYTES = tuple(bytes([i]) for i in range(256))
-CACHE_CAPACITY = 1_048_576
-_STREAM_CACHE_CAPACITY = 2048
+CACHE_CAPACITY = 1048576 # 1M
+_STREAM_CACHE_CAPACITY = 2048 # 2K
 
 
 class _DescendingPair(tuple):
