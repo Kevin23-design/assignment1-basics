@@ -35,7 +35,7 @@ CONFIG = {
     "train_file": str(ROOT / "data/owt_train.txt"),
     "valid_file": str(ROOT / "data/owt_valid.txt"),
     "bpe_prefix": str(ROOT / "outputs/830f59c92e15/tokenizer"),
-    "device": "cuda",
+    "device": "cuda:0",  # 用 CUDA_VISIBLE_DEVICES 在启动命令中选择 GPU。
     "precision": "bf16",
     "num_layers": 4,
     "d_model": 512,
