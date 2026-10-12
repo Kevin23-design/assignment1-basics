@@ -1,7 +1,14 @@
 import argparse
 import json
+import os
 import time
 from pathlib import Path
+
+if __name__ == "__main__":
+    cpu_threads = min(16, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[name] = str(min(cpu_threads, max(1, int(os.environ.get(name, cpu_threads)))))
+
 import wandb
 from wandb_record import experiment
 from bpe import CACHE_CAPACITY
@@ -15,6 +22,9 @@ def main():
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--special-tokens", nargs="*", default=["<|endoftext|>"])
     args = parser.parse_args()
+    for name in ("train_file", "valid_file"):
+        path = Path(getattr(args, name)).expanduser()
+        setattr(args, name, str(path if path.is_absolute() else root / path))
     config = {
         "train_file": args.train_file,
         "valid_file": args.valid_file,

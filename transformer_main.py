@@ -3,6 +3,14 @@ import time
 PROGRAM_STARTED_UNIX = time.time()
 PROGRAM_STARTED_CLOCK = time.perf_counter()
 
+import os
+
+# 在 NumPy/PyTorch 导入前限制底层计算线程；保留环境中更小的配额。
+CPU_THREADS = min(16, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
+if __name__ == "__main__":
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[name] = str(min(CPU_THREADS, max(1, int(os.environ.get(name, CPU_THREADS)))))
+
 # 实验二入口：计时从重型依赖导入之前开始，涵盖编码、训练、保存和验证。
 # ruff: noqa: E402
 from contextlib import nullcontext
@@ -267,6 +275,11 @@ def train_model(config, run):
 
 def main():
     config = CONFIG.copy()
+    # ~ 使用实际登录用户的 home；相对路径以项目目录为基准。
+    for key in ("train_file", "valid_file", "bpe_prefix", "resume", "output_dir"):
+        if config.get(key):
+            path = Path(config[key]).expanduser()
+            config[key] = str(path if path.is_absolute() else ROOT / path)
     budget = config["max_train_seconds"]
     previous = config["previous_elapsed_seconds"]
     if not math.isfinite(budget) or not 0 < budget <= BUDGET_SECONDS:
@@ -329,4 +342,6 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(min(CPU_THREADS, int(os.environ["OMP_NUM_THREADS"])))
+    torch.set_num_interop_threads(1)
     main()
