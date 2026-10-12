@@ -62,3 +62,63 @@ AdamW β=(0.9,0.999)、权重衰减 0.1、梯度裁剪 1.0。
 
 测试：`uv run pytest`。提交一份 Markdown 文档，包含姓名、学号、两项正式 W&B 链接，
 有续训时附关联运行。此前 PPL 64.75 是验证前缀的开发成绩，不能当作完整验证成绩。
+
+## BPE 缓存策略探索（云端）
+
+`benchmark_bpe_cache.py` 独立比较 `clear`（满后清空）、`lru`（淘汰最久未使用项）
+与 `freeze`（满后停止新增，已有项继续命中），不训练词表、不修改正式 BPE 配置。
+默认容量为 64K、256K、1M，每个组合三次正常测速，另可执行独立诊断。
+
+课程服务器使用公共环境，**不要执行 `uv sync` 或安装依赖**：
+
+```sh
+source /env/activate_a1.sh
+cd /ai/lmfs2026/$USER/assignment1-basics
+# 使用自己的 W&B 配置；环境已有登录记录时无需重复登录。
+export WANDB_ENTITY="你的实际账号或团队"
+export WANDB_PROJECT="lmfs-assignment1"
+export STUDENT_ID="你的学号"
+export WANDB_MODE="online"
+export PYTHONIOENCODING="utf-8"
+
+python benchmark_bpe_cache.py \
+  --tokenizer-prefix outputs/830f59c92e15/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --capacities 65536 262144 1048576 \
+  --policies clear lru freeze \
+  --repeats 3 \
+  --diagnostics \
+  --output-dir outputs/bpe-cache-exploration
+```
+
+分词器前缀须替换为自己的实际路径，三个 JSON 文件必须齐全。输出目录必须不存在，
+重复实验请换目录名。默认选择 Linux 当前允许使用的最小 CPU 编号；`--cpu N` 可指定
+允许使用的编号。父进程和所有子进程固定在同一个 CPU，串行运行，相关线程环境变量
+设为 1，实际最多使用 1 核，低于 16 核上限。公共数据始终以只读方式打开。
+
+完整流程为一次原版参考、27 次正常测速及 9 次独立诊断，共 37 个新子进程。
+每次刚加载分词器，从空缓存开始；读取数据、加载、W&B 初始化、源码记录在评分计时前。
+计时只包含全文编码、解码与原文比较，ID 精确对照、前 200 token 展示及上传在计时后。
+任一还原或 ID 对照失败即停止，查看对应 `.log` 和结果 JSON；正常报告只汇总通过的运行。
+
+默认每个子进程通过课程 `wandb_record.py` 创建探索 run，打印并保存源码快照，记录
+特殊 token 配置、前 200 token、全文还原结果及完整耗时。诊断 run 明确标记
+`diagnostic=true`，其耗时不纳入正常排名。网络不通时可设 `WANDB_MODE=offline`，
+之后使用课程环境的 `wandb sync` 上传相应离线目录。`--no-wandb` 仅供本地开发测试，
+其结果不能作为符合课程记录要求的实验材料。
+
+结果目录包含 `manifest.json`（输入/源码 SHA256、环境与固定随机顺序）、逐次 JSON/日志、
+`results.json`、`diagnostics.json`、`summary.csv`、`report.md` 和 `integrity.json`。
+报告分别按固定容量、固定策略分组，给出中位数与范围。相对原版速度比使用原版单次参考
+耗时除以候选中位数，注意单次参考本身的波动。完整 ID 参考以分块二进制文件临时保存，
+正常结束或 Python 异常时自动清理；不加载第二份完整 ID 列表。峰值 RSS 为整个子进程
+峰值（含导入、W&B），不是缓存单独占用。
+
+源码运行中不要修改。此工具沿用现有 BPE；词表是否来自完整 OWT 训练集、既有核心代码
+来源是否符合课程规定，仍需独立确认。本探索报告不替代最终正式 BPE 提交。
+
+仅运行小规模开发测试：
+
+```sh
+python -m pytest tests/test_bpe_cache_experiment.py -q
+```

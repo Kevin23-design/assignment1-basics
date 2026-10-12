@@ -112,6 +112,7 @@ class MultiHeadAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, token_positions), self.rope(k, token_positions)
         length = x.shape[-2]
+        # Create a causal mask
         mask = None  # You would need to define the mask based on your specific use case
         output = scaled_dot_product_attention(q, k, v, mask)
         return self.output_proj(output.transpose(-3, -2).flatten(-2))
@@ -175,19 +176,14 @@ def generate_clipping(parameters, max_l2_norm):
         g.mul_(scale)
         
 
-class AdamW(torch.optim.Optimizer)
+class AdamW(torch.optim.Optimizer):
+    """手写一、二阶矩、偏差校正和解耦权重衰减。"""
+
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__(params, defaults)
-        
+        if lr < 0 or eps <= 0 or weight_decay < 0 or any(not 0 <= b < 1 for b in betas):
+            raise ValueError("AdamW 超参数不合法")
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -195,26 +191,37 @@ class AdamW(torch.optim.Optimizer)
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
+            b1, b2 = group["betas"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("AdamW does not support sparse gradients")
+                if p.grad.is_sparse:
+                    raise RuntimeError("AdamW 不支持稀疏梯度")
+                grad = _accumulate_dtype(p.grad)
                 state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
+                if not state:
+                    state.update(step=0, m=torch.zeros_like(grad), v=torch.zeros_like(grad))
                 state["step"] += 1
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                denom = (exp_avg_sq.sqrt() / math.sqrt(1 - beta2 ** state["step"])).add_(group["eps"])
-                step_size = group["lr"] / (1 - beta1 ** state["step"])
-                p.addcdiv_(exp_avg, denom, value=-step_size)
-                if group["weight_decay"] != 0:
-                    p.add_(p, alpha=-group["weight_decay"] * group["lr"])
+                t, m, v = state["step"], state["m"], state["v"]
+                m.mul_(b1).add_(grad, alpha=1 - b1)
+                v.mul_(b2).addcmul_(grad, grad, value=1 - b2)
+                denominator = (v / (1 - b2**t)).sqrt().add_(group["eps"])
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_((m / (1 - b1**t) / denominator).to(p.dtype), alpha=-group["lr"])
         return loss
     
+
+def get_batch(dataset, batch_size, context_length, device,rng=None):
+    if dataset.ndim != 1 or len(dataset) < context_length or batch_size <= 0 or context_length <= 0:
+        raise ValueError("数据集必须是一维的，且长度大于上下文长度，batch_size 和 context_length 必须大于零")        
+    starts = (
+        np.random.randint(0, len(dataset) - context_length, size=batch_size)
+        if rng is None
+        else rng.integers(0, len(dataset) - context_length, size=batch_size)
+    )
+    indices = starts[:, None] + np.arange(context_length+1)
+    batch = torch.tensor(np.asarray(dataset[indices], dtype=np.int64), device=device)
+    return batch[:, :-1], batch[:, 1:]
+
+def save_checkpoint(model, optimizer, iteration, out):
+    torch.save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(), iteration=iteration), out)
