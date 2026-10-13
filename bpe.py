@@ -13,8 +13,9 @@ import regex
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 _PRETOKEN = regex.compile(PAT)
 _BYTES = tuple(bytes([i]) for i in range(256))
-CACHE_CAPACITY = 1048576 # 1M
-_STREAM_CACHE_CAPACITY = 2048 # 2K
+# 完整文本编码：容量探索后保留 1M 项，满后整体清空。
+CACHE_CAPACITY = 1_048_576
+_STREAM_CACHE_CAPACITY = 2048  # 流式编码独立限制为 2K 项。
 
 
 class _DescendingPair(tuple):
@@ -197,7 +198,7 @@ class BPE:
                     index += 1
             symbols = result
         ids = tuple(self._ids[symbol] for symbol in symbols)
-        # 仅缓存较短片段；达到容量后整体清空，防止缓存无限增长。
+        # 仅缓存较短片段；新片段插入前若已满，则整体清空再插入。
         if len(piece) <= 128:
             if len(self._cache) >= cache_capacity:
                 self._cache.clear()
