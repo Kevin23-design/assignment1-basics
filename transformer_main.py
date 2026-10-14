@@ -61,16 +61,16 @@ CONFIG = {
     "eval_batch_size": 16,
     "learning_rate": 3e-4,
     "min_learning_rate": 3e-5,
-    "warmup_steps": 200,
-    "cosine_steps": 20000,
+    "warmup_steps": 500,
+    "cosine_steps": 65000,
     "optimizer_betas": (0.9, 0.999),
     "optimizer_eps": 1e-8,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
     "seed": 42,
     "max_train_seconds": 21600,
-    # 固定预留 20 分钟供保存和完整验证；正式前需在目标设备确认足够。
-    "reserve_seconds": 1200,
+    # 历史保存+完整验证约 174 秒；下一版基线固定预留 10 分钟。
+    "reserve_seconds": 600,
     "resume": None,
     "resume_from_run": None,
     "previous_elapsed_seconds": 0.0,
@@ -240,6 +240,7 @@ def train_model(config, run):
         }
     )
     # 正式路径始终编码完整原文，编码与续训的耗时都计入累计预算。
+    encoding_started = time.perf_counter()
     if config.get("bpe_encode_workers", 1) > 1:
         run.config.update({"bpe_cpu_affinity": encoding_cpus(config["bpe_encode_workers"]),
                            "bpe_worker_threads": 1, "bpe_worker_gpu_visible": False})
@@ -248,6 +249,7 @@ def train_model(config, run):
     else:
         train = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
         valid = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
+    run.summary["time/encode_seconds"] = time.perf_counter() - encoding_started
     run.config.update({"train_token_count": len(train), "valid_token_count": len(valid)})
     if len(train) <= config["context_length"]:
         raise ValueError("训练数据长度必须超过上下文长度")
@@ -279,10 +281,13 @@ def train_model(config, run):
     interval_nll = None
     interval_tokens = None
     interval_steps = 0
+    interval_step_seconds = 0.0
+    total_step_seconds = 0.0
+    starting_step = global_step
     last_step_seconds = 0.0
 
     def log_interval():
-        nonlocal interval_steps
+        nonlocal interval_steps, interval_step_seconds
         logged_nll, logged_tokens = interval_nll.item(), interval_tokens.item()
         if logged_tokens > 0:
             if not math.isfinite(logged_nll) or logged_nll < 0:
@@ -290,7 +295,10 @@ def train_model(config, run):
             run.log(
                 {
                     "train/step": int(global_step),
+                    "train/loss": logged_nll / logged_tokens,
                     "train/ppl": math.exp(logged_nll / logged_tokens),
+                    "train/lr": lr,  # 最后一次已完成更新使用的 LR，对应 global_step - 1。
+                    "train/mean_step_seconds": interval_step_seconds / interval_steps,
                     "time/elapsed_seconds": config["previous_elapsed_seconds"]
                     + time.perf_counter()
                     - PROGRAM_STARTED_CLOCK,
@@ -299,7 +307,9 @@ def train_model(config, run):
         interval_nll.zero_()
         interval_tokens.zero_()
         interval_steps = 0
+        interval_step_seconds = 0.0
 
+    training_started = time.perf_counter()
     while True:
         if time.perf_counter() + reserve + 2 * last_step_seconds >= deadline:
             break
@@ -332,14 +342,25 @@ def train_model(config, run):
         interval_steps += 1
         synchronize(device)
         last_step_seconds = time.perf_counter() - started
+        interval_step_seconds += last_step_seconds
+        total_step_seconds += last_step_seconds
         if global_step % 100 == 0:
             log_interval()
     if interval_steps:
         log_interval()
+    training_seconds = time.perf_counter() - training_started
+    completed_steps = global_step - starting_step
+    run.summary.update({
+        "time/train_seconds": training_seconds,
+        "train/completed_steps_this_run": completed_steps,
+        "train/steps_per_second": completed_steps / training_seconds if training_seconds > 0 else 0.0,
+        "train/mean_step_seconds": total_step_seconds / completed_steps if completed_steps else 0.0,
+    })
     check_deadline(deadline)
     # 只保存最后模型，不按验证成绩挑选最佳检查点；模型文件仅保留在本地。
     checkpoint = out / "last.pt"
     partial = out / "last.pt.partial"
+    saving_started = time.perf_counter()
     torch.save(
         {
             "model": model.state_dict(),
@@ -353,10 +374,13 @@ def train_model(config, run):
         partial,
     )
     partial.replace(checkpoint)
+    run.summary["time/save_seconds"] = time.perf_counter() - saving_started
+    validation_started = time.perf_counter()
     val_nll_sum, val_token_count = evaluate(
         model, valid, config["context_length"], config["eval_batch_size"], device, config["precision"], deadline
     )
     synchronize(device)
+    run.summary["time/validation_seconds"] = time.perf_counter() - validation_started
     return {"val_nll_sum": float(val_nll_sum), "val_token_count": int(val_token_count), "step": int(global_step)}
 
 
@@ -388,7 +412,8 @@ def main():
         raise ValueError("BF16 需要支持该格式的 CUDA 设备")
     with experiment("transformer", config) as run:
         run.define_metric("train/step")
-        run.define_metric("train/ppl", step_metric="train/step")
+        for metric in ("train/ppl", "train/loss", "train/lr", "train/mean_step_seconds"):
+            run.define_metric(metric, step_metric="train/step")
         config["deadline_clock"] = PROGRAM_STARTED_CLOCK + config["max_train_seconds"] - previous
         try:
             result = train_model(config, run)
@@ -423,6 +448,7 @@ def main():
         final = {
             "run_id": run.id,
             "val/ppl": final_ppl,
+            "val/loss": val_loss,
             "val/token_count": result["val_token_count"],
             "train/final_step": result["step"],
             "train/total_seconds": total_seconds,
