@@ -1,10 +1,11 @@
-"""Experiment-only streaming BPE infrastructure; production BPE stays unchanged."""
+"""Streaming BPE process infrastructure; the default BPE interface stays unchanged."""
 from __future__ import annotations
 
 from array import array
 import io
 from itertools import islice
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -20,6 +21,11 @@ THREAD_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'BLIS_NUM_THREADS')
 TOKEN_BLOCK = 262144
 TEXT_BLOCK = 1 << 20
+
+
+def check_deadline(deadline):
+    if time.perf_counter() >= deadline:
+        raise TimeoutError('BPE encoding reached the formal run deadline')
 
 
 def restrict_environment():
@@ -119,7 +125,7 @@ def validate_tokenizer(bpe):
         raise ValueError('Vocabulary must contain all 256 bytes')
 
 
-def special_matches(source, specials, block_size=TEXT_BLOCK):
+def special_matches(source, specials, block_size=TEXT_BLOCK, deadline=math.inf):
     """Match the exact escaped-special alternation with bounded binary lookahead.
 
     Defer starts within max_special_bytes-1 bytes of a read boundary so that a
@@ -134,6 +140,7 @@ def special_matches(source, specials, block_size=TEXT_BLOCK):
     buffer, offset = b'', 0
     with open(source, 'rb') as handle:
         while True:
+            check_deadline(deadline)
             chunk = handle.read(block_size)
             buffer += chunk
             eof = not chunk
@@ -151,7 +158,8 @@ def special_matches(source, specials, block_size=TEXT_BLOCK):
                 break
 
 
-def split_ranges(source, bpe, workers, separator, block_size=TEXT_BLOCK):
+def split_ranges(source, bpe, workers, separator, block_size=TEXT_BLOCK, deadline=math.inf):
+    check_deadline(deadline)
     if separator not in bpe.special_tokens:
         raise ValueError('Split token must be in the loaded special-token configuration')
     size = Path(source).stat().st_size
@@ -162,7 +170,7 @@ def split_ranges(source, bpe, workers, separator, block_size=TEXT_BLOCK):
     targets = [size * i // workers for i in range(1, workers)]
     cuts, index = [0], 0
     raw_separator = separator.encode('utf-8')
-    for start, end, raw in special_matches(source, bpe.special_tokens, block_size):
+    for start, end, raw in special_matches(source, bpe.special_tokens, block_size, deadline):
         if raw != raw_separator:
             continue
         while index < len(targets) and start >= targets[index]:
@@ -195,10 +203,11 @@ class RangeReader(io.RawIOBase):
         super().close()
 
 
-def text_chunks(source, start, end, block_size=TEXT_BLOCK):
+def text_chunks(source, start, end, block_size=TEXT_BLOCK, deadline=math.inf):
     with io.TextIOWrapper(io.BufferedReader(RangeReader(source, start, end)),
                           encoding='utf-8', errors='strict', newline='') as handle:
         while text := handle.read(block_size):
+            check_deadline(deadline)
             yield text
 
 
@@ -229,14 +238,17 @@ def worker_entry(spec):
     partial = Path(str(part) + '.partial')
     metadata = Path(spec['metadata'])
     try:
+        deadline = spec.get('deadline', math.inf)
+        check_deadline(deadline)
         bpe = StreamingExperimentBPE()
         bpe.load(spec['tokenizer_prefix'])
         validate_tokenizer(bpe)
         bpe.configure(spec['capacity'], spec['diagnostic'])
         count = 0
-        pieces = iter(bpe.encode_iterable(text_chunks(spec['source'], spec['start'], spec['end'])))
+        pieces = iter(bpe.encode_iterable(text_chunks(spec['source'], spec['start'], spec['end'], deadline=deadline)))
         with partial.open('wb') as handle:
             while block := list(islice(pieces, TOKEN_BLOCK)):
+                check_deadline(deadline)
                 write_uint32(handle, block)
                 count += len(block)
         partial.replace(part)
@@ -252,7 +264,7 @@ def worker_entry(spec):
 
 
 def encode_parallel(source, tokenizer_prefix, destination, workers, capacity,
-                    separator, cpus, diagnostic=False):
+                    separator, cpus, diagnostic=False, deadline=math.inf):
     """Coordinator: no W&B, no comparison; all file creation is timed by caller."""
     if not 1 <= workers <= 16 or capacity <= 0:
         raise ValueError('Workers must be 1..16 and cache capacity positive')
@@ -268,11 +280,12 @@ def encode_parallel(source, tokenizer_prefix, destination, workers, capacity,
     partial = Path(str(destination) + '.partial')
     processes = []
     try:
+        check_deadline(deadline)
         started = time.perf_counter()
         bpe = BPE()
         bpe.load(tokenizer_prefix)
         validate_tokenizer(bpe)
-        ranges = split_ranges(source, bpe, workers, separator)
+        ranges = split_ranges(source, bpe, workers, separator, deadline=deadline)
         split_seconds = time.perf_counter() - started
         if len(ranges) != workers:
             return {'status': 'unavailable', 'reason': 'Insufficient distinct special-token cut points',
@@ -286,6 +299,7 @@ def encode_parallel(source, tokenizer_prefix, destination, workers, capacity,
             spec = {'source': str(source), 'tokenizer_prefix': str(tokenizer_prefix),
                     'start': start, 'end': end, 'cpus': cpus[i:i + 1],
                     'capacity': capacity, 'diagnostic': diagnostic,
+                    'deadline': deadline,
                     'part': str(work / f'part-{i:03d}.tokens'),
                     'metadata': str(work / f'part-{i:03d}.json')}
             specs.append(spec)
@@ -293,6 +307,7 @@ def encode_parallel(source, tokenizer_prefix, destination, workers, capacity,
             process.start()
             processes.append(process)
         while any(p.is_alive() for p in processes):
+            check_deadline(deadline)
             if any(p.exitcode not in (None, 0) for p in processes):
                 raise RuntimeError('Encoding worker failed; see worker traceback in coordinator log')
             for process in processes:
@@ -304,14 +319,18 @@ def encode_parallel(source, tokenizer_prefix, destination, workers, capacity,
         encode_seconds = time.perf_counter() - encoding_started
         metadata = [json.loads(Path(s['metadata']).read_text()) for s in specs]
         concat_started = time.perf_counter()
+        check_deadline(deadline)
         if workers == 1:
             Path(specs[0]['part']).replace(partial)
         else:
             with partial.open('wb') as output:
                 for spec in specs:
                     with open(spec['part'], 'rb') as part:
-                        shutil.copyfileobj(part, output, length=TEXT_BLOCK)
+                        while block := part.read(TEXT_BLOCK):
+                            check_deadline(deadline)
+                            output.write(block)
                     Path(spec['part']).unlink()
+        check_deadline(deadline)
         partial.replace(destination)
         concatenate_seconds = time.perf_counter() - concat_started
         result = {'status': 'ok', 'workers': workers, 'cache_capacity': capacity,
@@ -365,3 +384,26 @@ def compare_roundtrip(tokens, source, bpe):
                 raise ValueError('Decoded token bytes differ from original input')
         if original.read(1):
             raise ValueError('Decoded bytes are shorter than original input')
+
+
+def main():
+    # Spawn reimports this small module, never the Transformer/GPU entrypoint.
+    import argparse
+    import signal
+
+    def interrupted(signum, frame):
+        raise InterruptedError('BPE coordinator interrupted; terminating workers')
+
+    signal.signal(signal.SIGTERM, interrupted)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--job', required=True)
+    parser.add_argument('--result', required=True)
+    args = parser.parse_args()
+    restrict_environment()
+    job = json.loads(Path(args.job).read_text(encoding='utf-8'))
+    result = encode_parallel(**job)
+    Path(args.result).write_text(json.dumps(result), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

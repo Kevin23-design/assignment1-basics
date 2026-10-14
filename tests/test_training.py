@@ -112,7 +112,7 @@ def test_training_resume_and_full_validation(config, tmp_path, monkeypatch):
                     "reserve_seconds": 1,
                     **changes,
                 },
-                SimpleNamespace(id=name, config={}, log=logs.append),
+                SimpleNamespace(id=name, config={}, summary={}, log=logs.append),
             )
         return result, logs
 
@@ -135,6 +135,7 @@ def test_training_resume_and_full_validation(config, tmp_path, monkeypatch):
     assert full["val_token_count"] == len(tokens) - 1
     _, logs = run("logging", 101)
     assert [m["train/step"] for m in logs] == [100, 101]
+    assert [m["train/target_tokens"] for m in logs] == [100 * 16, 101 * 16]
     assert not list((tmp_path / "full").glob("*.json*"))
 
 

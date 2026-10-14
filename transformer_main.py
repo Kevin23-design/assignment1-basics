@@ -3,6 +3,18 @@ import time
 PROGRAM_STARTED_UNIX = time.time()
 PROGRAM_STARTED_CLOCK = time.perf_counter()
 
+import os
+
+# 在 NumPy/PyTorch 导入前限制底层计算线程；保留环境中更小的配额。
+CPU_THREADS = min(16, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
+if __name__ == "__main__":
+    # cuda:0 指向唯一可见 GPU；用户可在启动时指定物理编号或 UUID。
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, set(sorted(os.sched_getaffinity(0))[:16]))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[name] = str(min(CPU_THREADS, max(1, int(os.environ.get(name, CPU_THREADS)))))
+
 # 实验二入口：计时从重型依赖导入之前开始，涵盖编码、训练、保存和验证。
 # ruff: noqa: E402
 from contextlib import nullcontext
@@ -11,11 +23,17 @@ from itertools import islice
 import json
 import math
 from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import torch
 
 from bpe import BPE
+from parallel_bpe_encoding import THREAD_VARS, affinity
 from transformer_module import AdamW, TransformerLM, cross_entropy, get_batch, get_lr_cosine_schedule, gradient_clipping
 from wandb_record import experiment
 
@@ -24,10 +42,14 @@ ROOT = Path(__file__).resolve().parent
 MODEL_KEYS = ("context_length", "d_model", "num_layers", "num_heads", "d_ff", "rope_theta")
 # 只在这里填写路径和训练配置；运行命令不需要额外参数。
 CONFIG = {
-    "train_file": str(ROOT / "data/owt_train.txt"),
-    "valid_file": str(ROOT / "data/owt_valid.txt"),
-    "bpe_prefix": str(ROOT / "outputs/830f59c92e15/tokenizer"),
-    "device": "cuda",
+    "train_file": "/data/assignment1-data/owt_train.txt",
+    "valid_file": "/data/assignment1-data/owt_valid.txt",
+    "bpe_prefix": str(ROOT / "outputs/e9275a3b4a7a/tokenizer"),
+    "bpe_encode_workers": 16,
+    "bpe_worker_cache_capacity": 1_048_576,
+    "bpe_cache_policy": "clear_all",
+    "bpe_split_special_token": "<|endoftext|>",
+    "device": "cuda:0",  # 用 CUDA_VISIBLE_DEVICES 在启动命令中选择 GPU。
     "precision": "bf16",
     "num_layers": 4,
     "d_model": 512,
@@ -39,16 +61,16 @@ CONFIG = {
     "eval_batch_size": 16,
     "learning_rate": 3e-4,
     "min_learning_rate": 3e-5,
-    "warmup_steps": 200,
-    "cosine_steps": 20000,
+    "warmup_steps": 500,
+    "cosine_steps": 65000,
     "optimizer_betas": (0.9, 0.999),
     "optimizer_eps": 1e-8,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
     "seed": 42,
     "max_train_seconds": 21600,
-    # 固定预留 20 分钟供保存和完整验证；正式前需在目标设备确认足够。
-    "reserve_seconds": 1200,
+    # 历史保存+完整验证约 174 秒；下一版基线固定预留 10 分钟。
+    "reserve_seconds": 600,
     "resume": None,
     "resume_from_run": None,
     "previous_elapsed_seconds": 0.0,
@@ -93,6 +115,73 @@ def encode_file(bpe, source, destination, deadline):
         partial.replace(destination)
     finally:
         partial.unlink(missing_ok=True)
+    return np.memmap(destination, mode="r", dtype="<u4")
+
+
+def encoding_cpus(workers):
+    if not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("BPE worker 数须在 1..16 范围内")
+    if not hasattr(os, "sched_getaffinity"):
+        raise RuntimeError("正式多进程编码需要 Linux CPU affinity")
+    cpus = sorted(os.sched_getaffinity(0))[:workers]
+    if len(cpus) != workers:
+        raise ValueError(f"需要 {workers} 个 CPU，当前配额只有 {len(cpus)} 个，不自动降配")
+    return cpus
+
+
+def encode_file_parallel(config, source, destination, deadline):
+    """重新编码原文；无 GPU 的协调进程退出后才返回磁盘 token 数组。"""
+    check_deadline(deadline)
+    workers = config["bpe_encode_workers"]
+    cpus = encoding_cpus(workers)
+    affinity(cpus, include_descendants=True)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # 不能复用先前编码产物；与原 encode_file 一样重新写入完整数组。
+    destination.unlink(missing_ok=True)
+    environment = os.environ.copy()
+    environment.update({name: "1" for name in THREAD_VARS})
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    with tempfile.TemporaryDirectory(prefix="bpe-job-", dir=destination.parent) as temporary:
+        folder = Path(temporary)
+        job = {"source": str(source), "tokenizer_prefix": config["bpe_prefix"],
+               "destination": str(destination), "workers": workers,
+               "capacity": config["bpe_worker_cache_capacity"],
+               "separator": config["bpe_split_special_token"], "cpus": cpus, "deadline": deadline}
+        (folder / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        command = [sys.executable, str(ROOT / "parallel_bpe_encoding.py"),
+                   "--job", str(folder / "job.json"), "--result", str(folder / "result.json")]
+        process = subprocess.Popen(command, env=environment, start_new_session=True)
+        try:
+            while process.poll() is None:
+                check_deadline(deadline)
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.returncode:
+                raise RuntimeError(f"BPE 编码子进程失败，退出码 {process.returncode}")
+            check_deadline(deadline)
+            result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+            if result["status"] != "ok":
+                raise ValueError(f"无法安全分为 {workers} 片：{result.get('reason')}")
+            if result["token_count"] < 2 or destination.stat().st_size != result["token_count"] * 4:
+                raise ValueError("编码结果不足两个 token 或 uint32 文件大小错误")
+        except BaseException:
+            # 整个子进程组包含协调进程及其 spawn worker；异常不得留下后台编码。
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            destination.unlink(missing_ok=True)
+            Path(str(destination) + ".partial").unlink(missing_ok=True)
+            shutil.rmtree(Path(str(destination) + ".parts"), ignore_errors=True)
+            raise
     return np.memmap(destination, mode="r", dtype="<u4")
 
 
@@ -151,8 +240,16 @@ def train_model(config, run):
         }
     )
     # 正式路径始终编码完整原文，编码与续训的耗时都计入累计预算。
-    train = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
-    valid = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
+    encoding_started = time.perf_counter()
+    if config.get("bpe_encode_workers", 1) > 1:
+        run.config.update({"bpe_cpu_affinity": encoding_cpus(config["bpe_encode_workers"]),
+                           "bpe_worker_threads": 1, "bpe_worker_gpu_visible": False})
+        train = encode_file_parallel(config, config["train_file"], out / "train.tokens", deadline)
+        valid = encode_file_parallel(config, config["valid_file"], out / "valid.tokens", deadline)
+    else:
+        train = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
+        valid = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
+    run.summary["time/encode_seconds"] = time.perf_counter() - encoding_started
     run.config.update({"train_token_count": len(train), "valid_token_count": len(valid)})
     if len(train) <= config["context_length"]:
         raise ValueError("训练数据长度必须超过上下文长度")
@@ -184,10 +281,13 @@ def train_model(config, run):
     interval_nll = None
     interval_tokens = None
     interval_steps = 0
+    interval_step_seconds = 0.0
+    total_step_seconds = 0.0
+    starting_step = global_step
     last_step_seconds = 0.0
 
     def log_interval():
-        nonlocal interval_steps
+        nonlocal interval_steps, interval_step_seconds
         logged_nll, logged_tokens = interval_nll.item(), interval_tokens.item()
         if logged_tokens > 0:
             if not math.isfinite(logged_nll) or logged_nll < 0:
@@ -195,7 +295,11 @@ def train_model(config, run):
             run.log(
                 {
                     "train/step": int(global_step),
+                    "train/target_tokens": global_step * config["batch_size"] * config["context_length"],
+                    "train/loss": logged_nll / logged_tokens,
                     "train/ppl": math.exp(logged_nll / logged_tokens),
+                    "train/lr": lr,  # 最后一次已完成更新使用的 LR，对应 global_step - 1。
+                    "train/mean_step_seconds": interval_step_seconds / interval_steps,
                     "time/elapsed_seconds": config["previous_elapsed_seconds"]
                     + time.perf_counter()
                     - PROGRAM_STARTED_CLOCK,
@@ -204,7 +308,9 @@ def train_model(config, run):
         interval_nll.zero_()
         interval_tokens.zero_()
         interval_steps = 0
+        interval_step_seconds = 0.0
 
+    training_started = time.perf_counter()
     while True:
         if time.perf_counter() + reserve + 2 * last_step_seconds >= deadline:
             break
@@ -237,14 +343,29 @@ def train_model(config, run):
         interval_steps += 1
         synchronize(device)
         last_step_seconds = time.perf_counter() - started
+        interval_step_seconds += last_step_seconds
+        total_step_seconds += last_step_seconds
         if global_step % 100 == 0:
             log_interval()
     if interval_steps:
         log_interval()
+    training_seconds = time.perf_counter() - training_started
+    completed_steps = global_step - starting_step
+    run.summary.update({
+        "time/train_seconds": training_seconds,
+        "train/completed_steps_this_run": completed_steps,
+        "train/target_tokens": global_step * config["batch_size"] * config["context_length"],
+        "train/target_tokens_this_run": completed_steps * config["batch_size"] * config["context_length"],
+        "train/tokens_per_second": completed_steps * config["batch_size"] * config["context_length"]
+        / training_seconds if training_seconds > 0 else 0.0,
+        "train/steps_per_second": completed_steps / training_seconds if training_seconds > 0 else 0.0,
+        "train/mean_step_seconds": total_step_seconds / completed_steps if completed_steps else 0.0,
+    })
     check_deadline(deadline)
     # 只保存最后模型，不按验证成绩挑选最佳检查点；模型文件仅保留在本地。
     checkpoint = out / "last.pt"
     partial = out / "last.pt.partial"
+    saving_started = time.perf_counter()
     torch.save(
         {
             "model": model.state_dict(),
@@ -258,15 +379,30 @@ def train_model(config, run):
         partial,
     )
     partial.replace(checkpoint)
+    run.summary["time/save_seconds"] = time.perf_counter() - saving_started
+    validation_started = time.perf_counter()
     val_nll_sum, val_token_count = evaluate(
         model, valid, config["context_length"], config["eval_batch_size"], device, config["precision"], deadline
     )
     synchronize(device)
+    run.summary["time/validation_seconds"] = time.perf_counter() - validation_started
+    if config.get("expected_validation_targets") is not None and val_token_count != config["expected_validation_targets"]:
+        raise ValueError("完整验证目标数与实验要求不一致")
     return {"val_nll_sum": float(val_nll_sum), "val_token_count": int(val_token_count), "step": int(global_step)}
 
 
 def main():
     config = CONFIG.copy()
+    workers = config.get("bpe_encode_workers", 1)
+    if not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("BPE worker 数须在 1..16 范围内")
+    if config.get("bpe_encode_workers", 1) > 1:
+        affinity(encoding_cpus(config["bpe_encode_workers"]), include_descendants=True)
+    # ~ 使用实际登录用户的 home；相对路径以项目目录为基准。
+    for key in ("train_file", "valid_file", "bpe_prefix", "resume", "output_dir"):
+        if config.get(key):
+            path = Path(config[key]).expanduser()
+            config[key] = str(path if path.is_absolute() else ROOT / path)
     budget = config["max_train_seconds"]
     previous = config["previous_elapsed_seconds"]
     if not math.isfinite(budget) or not 0 < budget <= BUDGET_SECONDS:
@@ -283,7 +419,9 @@ def main():
         raise ValueError("BF16 需要支持该格式的 CUDA 设备")
     with experiment("transformer", config) as run:
         run.define_metric("train/step")
-        run.define_metric("train/ppl", step_metric="train/step")
+        run.define_metric("train/target_tokens", step_metric="train/step")
+        for metric in ("train/ppl", "train/loss", "train/lr", "train/mean_step_seconds"):
+            run.define_metric(metric, step_metric="train/step")
         config["deadline_clock"] = PROGRAM_STARTED_CLOCK + config["max_train_seconds"] - previous
         try:
             result = train_model(config, run)
@@ -292,6 +430,11 @@ def main():
             try:
                 synchronize(config["device"])
             finally:
+                if torch.device(config["device"]).type == "cuda":
+                    run.summary.update({
+                        "gpu/peak_allocated_bytes": torch.cuda.max_memory_allocated(config["device"]),
+                        "gpu/peak_reserved_bytes": torch.cuda.max_memory_reserved(config["device"]),
+                    })
                 ended_unix = time.time()
                 current_seconds = time.perf_counter() - PROGRAM_STARTED_CLOCK
                 total_seconds = previous + current_seconds
@@ -318,6 +461,7 @@ def main():
         final = {
             "run_id": run.id,
             "val/ppl": final_ppl,
+            "val/loss": val_loss,
             "val/token_count": result["val_token_count"],
             "train/final_step": result["step"],
             "train/total_seconds": total_seconds,
@@ -329,4 +473,6 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(min(CPU_THREADS, int(os.environ["OMP_NUM_THREADS"])))
+    torch.set_num_interop_threads(1)
     main()

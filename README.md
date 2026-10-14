@@ -1,15 +1,14 @@
 # BPE 与 Transformer 作业
 
-保留五个核心文件：`bpe.py`、`train_bpe.py`、`transformer_module.py`、
-`transformer_main.py` 和课程提供的 `wandb_record.py`。
+正式源码包括 `bpe.py`、`train_bpe.py`、`transformer_module.py`、
+`transformer_main.py`、`parallel_bpe_encoding.py` 和课程提供的 `wandb_record.py`。
 模型核心、BPE 和课程源码记录器保持不变。
 
 ## 环境与运行
 
 ```sh
-uv python pin 3.13
-uv sync --locked
-uv run wandb login
+source /env/activate_a1.sh
+wandb login
 export WANDB_ENTITY="你的实际账号或团队"
 export WANDB_PROJECT="lmfs-assignment1"
 export STUDENT_ID="你的学号"
@@ -20,35 +19,85 @@ export PYTHONIOENCODING="utf-8"
 任务一入口：
 
 ```sh
-uv run python train_bpe.py
+python train_bpe.py
 ```
+
+完整文本编码保留 **1,048,576 项、满后整体清空** 的缓存；只缓存不超过 128 字符的
+普通预分词片段。正式入口的 W&B 配置记录 `clear_all` 与实际缓存容量。
+流式 `encode_iterable()` 继续使用独立的 2,048 项缓存。
+
+云端三轮缓存探索中，1M 清空策略中位数为 41.499 秒；1M 停止新增为 41.728 秒，
+1M LRU 为 51.577 秒，全部通过完整 ID 对照与全文还原。1M 实际缓存 627,462 项，
+未触发容量上限，因此本次无法比较它与停止新增策略在满后的行为。当前继续保留原策略。
+以上是探索结果，最终提交仍使用正式 W&B 验证记录。
 
 任务二只修改 `transformer_main.py` 顶部的 `CONFIG` 字典，然后在项目根目录执行：
 
 ```sh
-uv run python transformer_main.py
+CUDA_VISIBLE_DEVICES=0 python transformer_main.py
 ```
 
 不再使用命令行参数、开发清单、梯度累积或自动验证耗时估算。
 配置中的原始训练和验证文件必须是完整 OWT 文件。分词器默认指向本人已训练的
-`outputs/830f59c92e15/tokenizer`；迁移时携带同前缀的 vocab、merges、config 三个 JSON 文件。
+`outputs/e9275a3b4a7a/tokenizer`；迁移时携带同前缀的 vocab、merges、config 三个 JSON 文件。
+
+原文默认读取 `/data/assignment1-data/owt_train.txt` 和 `owt_valid.txt`。
+公共环境只激活使用，不执行 `uv sync` 或修改依赖。
+
+正式编码采用云端已确认的 **16 workers × 每 worker 1,048,576 项、满后清空**：
+验证集三轮中位数 7.356 秒；完整训练集一次确认 183.402 秒，8 workers 为 336.431 秒。
+两种训练集配置均通过完整 ID 对照和原文字节还原，16 workers 的产物 SHA-256 与参考相同。
+这些是探索成绩，新的正式运行仍从入口计时，重新编码完整 train/valid，包含启动、分片、
+读写、合并与清理时间，不加载探索产物跳过编码。
+
+`CONFIG` 中的 `bpe_encode_workers=16`、`bpe_worker_cache_capacity=1048576` 和
+`bpe_split_special_token="<|endoftext|>"` 控制编码。Linux 当前可用逻辑 CPU 少于配置数量
+时直接报错，不自动降配。整个程序 CPU affinity 最多 16 个 CPU，worker 各绑定一个 CPU，
+内部线程为 1 且看不到 GPU；协调进程和所有 worker 退出后才初始化模型。父进程保留一张
+可见 GPU，`CUDA_VISIBLE_DEVICES` 可指定物理编号或 UUID，代码始终使用 `cuda:0`。
+W&B 配置记录 worker 数、容量、策略与实际 CPU 集合，源码记录器同时包含辅助模块。
+
+只能在分词器实际识别到的完整特殊 token 之后分片；不足所需非空分片时正式运行报错。
+六小时截止检查覆盖切点扫描、worker 读写、等待和拼接，异常清理临时分片，不进入训练。
+默认 BPE `encode_iterable()` 仍保持原有 2K 缓存；`bpe_encode_workers=1` 使用原单进程
+路径，供调试与兼容旧配置。续训继续使用原 run 的分词器及模型配置。
 
 模型配置为 4 层、512 维、8 头、FFN 1408、上下文 512、BF16。
 batch 64，即每次更新 32,768 token，面向 A100/A800 80GB，尚未在该卡上确认吞吐。
 AdamW β=(0.9,0.999)、权重衰减 0.1、梯度裁剪 1.0。
-学习率为 3e-4→3e-5，warmup 200 步，余弦终点 20,000 步；之后保持最低学习率。
-这些是候选超参数，不是已验证的最优值。更改学习率或路径直接修改 `CONFIG`。
+下一版候选基线学习率为 3e-4→3e-5，warmup 500 步，余弦终点为全局 step 65,000；
+终点后保持最低学习率。固定预留 600 秒收尾，累计预算仍为 21,600 秒。
+模型、batch、AdamW 与 16-worker 编码配置保持不变，从随机权重启动新的正式 run。
+这些参数尚待云端验证，65K 不是最终步数保证；本轮评估整套训练安排，不能将收益单独
+归因于 warmup、余弦终点或收尾预留。更改学习率或路径直接修改 `CONFIG`。
+
+优先查看 W&B 的 `train/loss` 曲线；它是区间总 NLL / 总目标 token 数，`train/ppl`
+为该 loss 的指数。每 100 次更新及最后不足 100 步的区间记录 `train/lr` 和
+`train/mean_step_seconds`，横轴均为 `train/step`。LR 是最后一次已完成更新的值，
+调度索引对应显示 step 减一；平均步耗时包括数据采样、前后向、更新与同步，不包含日志上传。
+设备端累计方式保持不变，不新增逐步 `.item()`。
+
+Summary 增加 `time/encode_seconds`（完整 train/valid 编码）、`time/train_seconds`
+（本次训练循环，含区间日志）、`time/save_seconds`、`time/validation_seconds` 和
+`val/loss`。`train/steps_per_second` 按本次完成的更新数 / 本次训练循环耗时计算；
+Summary 的 `train/mean_step_seconds` 是本次所有已完成更新的平均耗时。分阶段耗时不覆盖
+全部初始化操作，六小时预算仍以入口起算的累计墙钟耗时为准。所有新增记录操作也计入预算。
+
+历史成功 run 的完整验证 PPL 为 49.16284，保存与完整验证约 174 秒，为 600 秒预留
+提供参考。新 run 必须完整验证并在六小时内结束，再比较最终 PPL、实际最终 step 与吞吐，
+在结果出来前不认定已经提优。旧检查点续训应恢复原 run 的 warmup、余弦终点等配置，
+不能直接沿用这版新的默认调度。
 
 ## 课程要求保留项
 
 - 使用本人 BPE 编码完整原文，不额外插入标记；模型从随机权重开始。
 - 编码后写入磁盘 token 数组，从整个训练数组随机抽取连续窗口。
 - 模型各层、注意力、交叉熵、AdamW、调度和梯度裁剪均为手写实现。
-- 每 100 次更新向 W&B 记录区间训练 PPL，尾部不足 100 步也记录；日志损失在设备上累计。
+- 每 100 次更新向 W&B 记录区间训练 loss、PPL、最后使用的 LR 和平均步耗时，尾部也记录。
 - 仅保存最后模型及优化器、步数和随机状态到本地 `last.pt`，随后验证完整 OWT 验证集。
 - 验证关闭梯度，按总目标 NLL / 总目标数计算 PPL，尾部计分，仅首 token 无预测目标。
 - 从入口最顶部计时，导入、W&B、源码、编码、初始化、训练、保存和最终验证均计入累计六小时。
-- 固定预留 1,200 秒收尾，不再自动估算；须在目标设备上确认足够，超时会报错。
+- 候选基线固定预留 600 秒收尾，不自动估算；须在目标设备上验证足够，超时会报错。
 - W&B 记录源码、配置、最终 PPL、步数、UTC 起止时间、累计耗时及是否超出六小时。
 
 本地不再额外生成 `metrics.jsonl`、`config.json`、`result.json`、`timing.json` 或数据指纹文件。
@@ -60,8 +109,8 @@ AdamW β=(0.9,0.999)、权重衰减 0.1、梯度裁剪 1.0。
 继续使用原分词器、数据、模型和优化器配置；程序不再自动核对其哈希和配置一致性。
 每次启动仍重新编码原文，耗时计入累计预算，不使用免计时的开发缓存。
 
-测试：`uv run pytest`。提交一份 Markdown 文档，包含姓名、学号、两项正式 W&B 链接，
-有续训时附关联运行。此前 PPL 64.75 是验证前缀的开发成绩，不能当作完整验证成绩。
+测试：`python -m pytest`。提交一份 Markdown 文档，包含姓名、学号、两项正式 W&B 链接，
+有续训时附关联运行。
 
 ## BPE 缓存策略探索（云端）
 
@@ -214,3 +263,92 @@ python -m pytest tests/test_parallel_bpe_experiment.py -q
 本工具不自动接入正式 Transformer，也不预生成 token 用于绕过正式计时。正式接入需等待
 结果确认，仍应从入口开始计时、重新编码 train/valid，并在训练前确认所有 worker 已退出。
 完整训练集来源和课程对 AI 核心代码来源的规定须独立确认。
+
+## 四 GPU 上下文 × 峰值学习率探索
+
+本节仅用于 `exploration`。训练与编码同步最新 `dev` 基线，已有 BPE 探索工具保留，
+不修改 `dev`。四组固定配置如下，每步均处理 32,768 个目标 token：
+
+| 组 | CUDA_VISIBLE_DEVICES | 训练/验证上下文 | batch | 峰值 LR |
+|---|---:|---:|---:|---:|
+| A | 0 | 512 | 64 | 3e-4 |
+| B | 1 | 512 | 64 | 6e-4 |
+| C | 2 | 256 | 128 | 3e-4 |
+| D | 3 | 256 | 128 | 6e-4 |
+
+其余固定为 4 层、512 维、8 头、FFN 1408、BF16、seed 42、warmup 500、余弦终点
+65K、最低 LR 3e-5、AdamW β=(0.9,0.999)、weight decay 0.1、梯度裁剪 1.0。
+每组独立六小时预算，固定 600 秒收尾；均从随机权重开始，无续训或超参覆盖入口。
+本轮**不做显存试训或预检**，OOM 会作为该组失败记录。
+
+本轮以用户已获批的 **64 个逻辑 CPU 总配额**运行，不沿用单个 run 的 16 核总配额
+来解释四组并发权限。启动器读取 Linux 当前允许 CPU，取前 64 个，分成四个互不重叠的
+16 核集合；不足 64 核则启动前报错。每组父进程与子进程均硬限制在对应集合，编码采用
+16 workers、每 worker 1M 缓存、满后清空，worker 内部线程为 1 且隐藏 GPU。
+正式进程的计算线程最多 16 个，只看到指定的一张 GPU，内部设备为 `cuda:0`。
+启动器仅使用标准库，不导入 NumPy/PyTorch，不创建第五个 W&B run。
+
+云端进入自己的 exploration 项目目录，激活共享环境并配置个人 W&B：
+
+```sh
+source /env/activate_a1.sh
+export WANDB_ENTITY="你的实际账号或团队"
+export WANDB_PROJECT="lmfs-assignment1"
+export STUDENT_ID="你的学号"
+export WANDB_MODE="online"
+export PYTHONIOENCODING="utf-8"
+
+python launch_context_lr_experiments.py \
+  --gpus 0 1 2 3 \
+  --output-dir outputs/context-lr-2x2
+```
+
+请确保输出目录不存在，磁盘至少有约 100 GB 空闲，公共 OWT 文件可读，项目内
+`outputs/e9275a3b4a7a/tokenizer` 的三个 JSON 文件齐全。公共环境只读使用，不安装依赖。
+启动器分别生成 `A.log` 至 `D.log`，以及四个独立目录 `A/` 至 `D/`。W&B 仍在
+`outputs/<run_id>/source` 保存源码快照。数据源、tokenizer、模型、优化器和随机种子保持
+一致；四组均重新编码完整原文到各自目录，不共享可写 token 文件。编码、加载、读写、
+初始化、W&B 源码记录、训练、保存和完整验证全部计入各自入口起算的六小时。
+各组全部编码 worker 退出后才初始化模型。
+
+实验系列 ID 默认由启动时间生成，也可用 `--study-id my-study` 指定。每组创建一个
+`transformer-context-lr-exploration` W&B run，名称包含系列与 A/B/C/D，group 为
+学号加系列 ID。源文件必须在项目目录内，运行中不要修改或切换源码。
+
+如需单独启动指定组，使用同一个系列 ID，显式提供其获批的 16 个 CPU 编号。例如下例
+仅适用于 CPU 0..15 位于当前允许集合时：
+
+```sh
+CUDA_VISIBLE_DEVICES=0 python train_context_lr_experiment.py \
+  --case A --cpu-ids 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
+  --study-id my-study --output-dir outputs/my-study-A
+```
+
+沿用每 100 步及尾部区间的 loss/PPL/LR/平均步耗时日志。新增 `train/target_tokens`
+作为累计目标 token 坐标，W&B 可将其选为 loss 曲线横轴；相同 step 对应相同目标 token
+数，但上下文改变后并不使用相同的采样序列。Summary 记录整体训练 token/s、最终 step、
+完整验证 loss/PPL、阶段耗时、实际 GPU 型号与容量、GPU 峰值 allocated/reserved bytes。
+GPU 峰值从初始化模型前重置，包含模型、训练和验证分配；无额外逐步 `.item()`。
+
+A/B 使用完整 512 窗口验证，C/D 使用完整 256 窗口验证，eval batch 均为 16。
+所有结果要求有效目标数 **66,401,097**，尾部计分，只排除首 token。**不做统一窗口验证**。
+B/A 和 D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 的上下文安排。
+跨上下文的最终 PPL 评价整套配置，不能单独归因于训练上下文。四组并发共享磁盘，
+编码耗时可能不同于单 GPU 历史记录，应结合实际训练 token 预算和 GPU 型号解释吞吐。
+
+每组可捕获的 OOM、非有限 loss、超时或验证失败单独记录，不终止其他组；有限性检查
+保持现有区间频率，不是每一步进行数值读取。单组 `result.json` 保存 run 链接、配置、
+状态与 Summary；启动器在组结束后更新 `results.json`、`results.csv` 与 `report.md`。
+只有完整验证成功、源码未变、验证目标数正确且累计不超过六小时的结果进入有效表。
+历史完整验证 PPL **40.60899** 仅作参考，本工具不会自动修改 dev。
+
+按 Ctrl-C 或对启动器发送 SIGTERM，会终止并等待它管理的 run 进程组及嵌套编码组。
+单独对某组发送 SIGTERM 只停止该组；强制 SIGKILL/断电时可能没有完整的末尾指标，
+对应结果不作为有效成绩。网络不通可设 `WANDB_MODE=offline`，之后分别同步四个离线 run。
+
+本地仅运行小规模测试，不启动云端 GPU 训练：
+
+```sh
+python -m pytest tests/test_context_lr_experiments.py tests/test_training.py \
+  tests/test_optimizer.py tests/test_train_bpe.py tests/test_tokenizer.py -q
+```
