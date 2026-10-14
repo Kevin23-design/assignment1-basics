@@ -94,9 +94,10 @@ def test_launcher_import_is_stdlib_only():
     assert result.returncode == 0
 
 
-def test_live_run_capture_and_entry_time(monkeypatch, tmp_path):
+@pytest.mark.parametrize('case', ['A', 'E', 'F'])
+def test_live_run_capture_and_entry_time(monkeypatch, tmp_path, case):
     root = tmp_path
-    output = root / 'outputs' / 'A'
+    output = root / 'outputs' / case
     monkeypatch.setattr(runner, 'ROOT', root)
     monkeypatch.setattr(runner, 'prepare_environment', lambda cpus, gpu: None)
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
@@ -112,7 +113,7 @@ def test_live_run_capture_and_entry_time(monkeypatch, tmp_path):
     run = SimpleNamespace(id='run', summary=summary, url='https://example.com/run')
     @contextmanager
     def record(task, config, root):
-        assert task == 'transformer-context-lr-exploration'
+        assert task == f'transformer-{runner.case_suite(case)}-exploration'
         frozen = root / 'outputs/run/source'
         frozen.mkdir(parents=True)
         (root / 'source.py').write_text('source')
@@ -129,11 +130,11 @@ def test_live_run_capture_and_entry_time(monkeypatch, tmp_path):
     trainer.main = main
     monkeypatch.setitem(sys.modules, 'transformer_main', trainer)
     monkeypatch.setitem(sys.modules, 'wandb_record', SimpleNamespace(experiment=record))
-    runner.execute(SimpleNamespace(case='A', cpu_ids=list(range(16)), study_id='study', output_dir=str(output)))
+    runner.execute(SimpleNamespace(case=case, cpu_ids=list(range(16)), study_id='study', output_dir=str(output)))
     result = json.loads((output / 'result.json').read_text())
     assert result['eligible'] and result['status'] == 'completed'
-    assert events == [('device', 0), ('reset', 0), ('training', 'A')]
-    assert run.name == 'student-study-A' and run.group == 'student-study'
+    assert events == [('device', 0), ('reset', 0), ('training', case)]
+    assert run.name == f'student-study-{case}' and run.group == 'student-study'
 
 
 def test_collect_keeps_failure_isolated(monkeypatch, tmp_path):

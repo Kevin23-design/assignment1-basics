@@ -352,3 +352,83 @@ B/A 和 D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 
 python -m pytest tests/test_context_lr_experiments.py tests/test_training.py \
   tests/test_optimizer.py tests/test_train_bpe.py tests/test_tokenizer.py -q
 ```
+
+## GPU 2、3：优化器组合与大 batch 候选
+
+新增 `optimizer-batch` suite，仅用于 `exploration`；不更新 `dev`。旧 A–D 配置和默认
+四卡启动命令保持兼容。新 suite 固定为：
+
+| 参数 | E（GPU 2） | F（GPU 3） |
+|---|---:|---:|
+| 训练/验证 context | 256 | 256 |
+| batch | 128 | 256 |
+| 每步目标 token | 32,768 | 65,536 |
+| 峰值 LR | 3e-4 | 6e-4 |
+| AdamW β | (0.9, 0.95) | (0.9, 0.95) |
+| weight decay | 0.01 | 0.01 |
+| 梯度裁剪阈值 | 2.0 | 2.0 |
+| warmup steps | 500 | 250 |
+| cosine 终点 step | 65,000 | 32,500 |
+
+两组最低 LR 均为 3e-5。F 的 warmup 和余弦终点步数减半，与 E 对齐到相同目标 token
+预算：warmup **16,384,000**、余弦终点 **2,129,920,000** tokens。模型、BF16、seed 42、
+初始化、BPE、原文、采样规则和 eval batch 16 沿用当前基线；均从随机权重开始，各自六小时，
+固定 600 秒收尾，重新编码完整 train/valid。不做显存试训、不自动降低 batch；OOM 单独记为
+失败，不停止另一组。
+
+F 使用 6e-4 的依据是上一轮 256 窗口实验：C（batch128、LR3e-4）的完整验证 PPL 为
+45.18785，D（batch128、LR6e-4）为 41.75639。F 是性能候选，不是 batch 单因素实验。
+E 同时改变三项优化器设置，F 又改变 batch 与峰值 LR，本轮只评估组合效果，不提前认定更优。
+
+运行（共享环境和个人 W&B 变量沿用上一节）：
+
+```sh
+source /env/activate_a1.sh
+
+python launch_context_lr_experiments.py \
+  --suite optimizer-batch \
+  --gpus 2 3 \
+  --output-dir outputs/optimizer-batch-2gpu
+```
+
+新 suite 不指定 `--gpus` 时也默认 2、3，不指定输出路径时默认上述目录。输出目录必须不存在，
+磁盘至少约 **50 GB** 空闲。旧 `context-lr` suite 仍默认 GPU 0/1/2/3、100 GB 磁盘检查。
+单组入口可用 `--case E` 或 `--case F`，suite 自动推断，也可显式传入
+`--suite optimizer-batch`；不能传入任意超参或不匹配的 case/suite。
+
+CPU 保留原 C/D 分区：从当前允许 CPU 排序后的前 64 核中，E 使用第 33–48 核，F 使用
+第 49–64 核。因此仍要求允许集合至少有 **64 核**，但两组实际只使用后面的 **32 核**，
+不自动改用前 32 核。每组维持 16 个编码 worker、每 worker 1M 缓存、满后清空、单内部线程、
+worker 隐藏 GPU；其余进程资源隔离和异常清理沿用原启动器。
+若 GPU 0/1 仍在同目录运行旧版本，应把新版本部署到独立项目副本，避免源码变化使旧 run
+的源码完整性检查失败；保留 CPU 分区不等于可以在运行中修改其源码。
+
+W&B job type 为 `transformer-optimizer-batch-exploration`，每组一个 run，共用系列 ID。
+`result.json` 和 W&B config 包含 suite、完整超参、每步 token、warmup/余弦终点 token。
+汇总 CSV/Markdown 新增 β₁/β₂、weight decay、裁剪阈值、每步 token 和调度终点；报告按
+各组实际 token 数显示，不再将所有实验写成每步固定 32,768 tokens。
+
+上一轮提前约 1800 秒退出的原因尚未确认，本轮不修改停训策略。触发原条件
+`now + reserve_seconds + 2 * last_step_seconds >= deadline` 时，在 Summary 记录：
+
+- `time/train_stop_reason`：`reserve_plus_two_last_steps`；
+- `time/train_stop_elapsed_seconds`：入口累计 elapsed（含续训历史预算）；
+- `time/train_stop_remaining_seconds`：距离本轮累计截止时刻的剩余秒数；
+- `time/train_stop_last_step_seconds`：最后一次已完成更新的耗时；
+- `time/train_stop_step_safety_seconds`：上述耗时的两倍；
+- `time/train_stop_reserve_seconds`：本轮固定收尾预留。
+
+这些字段连同编码、训练、保存和验证耗时写入汇总 CSV。异常退出使用已有的失败状态记录，
+不把它伪装成正常触发收尾条件。诊断只记录现有 CPU 时钟，不新增逐步 GPU `.item()`。
+
+两组均用完整 256 窗口验证，目标数必须为 **66,401,097**。主要比较最终验证 PPL，另外按
+相同累计目标 token 附近比较区间 loss，结合实际 token/s、最终 token 总量、峰值显存和预算
+利用情况判断。E/F 的每步 token 数不同，不按相同 step 假定预算相同，也不将不同并发负载下
+的吞吐差异全部归因于超参。仅完整验证成功、源码未变且累计不超过六小时的结果进入有效表。
+
+小规模本地检查（不启动正式 GPU 训练）：
+
+```sh
+python -m pytest tests/test_optimizer_batch_suite.py tests/test_context_lr_experiments.py \
+  tests/test_training.py tests/test_optimizer.py tests/test_train_bpe.py tests/test_tokenizer.py -q
+```

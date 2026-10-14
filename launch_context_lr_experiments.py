@@ -1,4 +1,4 @@
-"""Standard-library-only launcher for four independent six-hour GPU cases."""
+"""Standard-library-only launcher for fixed independent six-hour GPU suites."""
 from __future__ import annotations
 
 import argparse
@@ -14,17 +14,20 @@ import subprocess
 import sys
 import time
 
-from train_context_lr_experiment import CASES, ROOT, eligible_result, save_result
+from train_context_lr_experiment import ROOT, SUITES, case_parameters, case_suite, eligible_result, save_result
 
 SKIP = {'.git', '.venv', 'venv', 'outputs', 'wandb', 'data', 'datasets',
         'checkpoints', '__pycache__', '.pytest_cache'}
 
 
-def allocate_cpus(allowed):
+def allocate_cpus(allowed, suite='context-lr'):
     allowed = sorted(set(allowed))
     if len(allowed) < 64:
-        raise ValueError(f'Four cases require 64 allowed logical CPUs; found {len(allowed)}')
-    return {case: allowed[index * 16:(index + 1) * 16] for index, case in enumerate(CASES)}
+        raise ValueError(f'This CPU partition requires 64 allowed logical CPUs; found {len(allowed)}')
+    settings = SUITES[suite]
+    offset = settings['cpu_offset']
+    return {case: allowed[offset + index * 16:offset + (index + 1) * 16]
+            for index, case in enumerate(settings['cases'])}
 
 
 def source_fingerprints():
@@ -44,7 +47,8 @@ def case_command(case, cpus, study, out, gpu):
     environment = os.environ.copy()
     environment['CUDA_VISIBLE_DEVICES'] = str(gpu)
     command = [sys.executable, str(ROOT / 'train_context_lr_experiment.py'), '--case', case,
-               '--cpu-ids', *map(str, cpus), '--study-id', study, '--output-dir', str(out)]
+               '--cpu-ids', *map(str, cpus), '--study-id', study, '--suite', case_suite(case),
+               '--output-dir', str(out)]
     return command, environment
 
 
@@ -97,6 +101,7 @@ def stop_processes(processes):
 
 
 def collect(out, manifest, exit_codes, interrupted=False):
+    suite = manifest.get('suite', 'context-lr')
     results = []
     for case, values in manifest['cases'].items():
         path = out / case / 'result.json'
@@ -115,19 +120,32 @@ def collect(out, manifest, exit_codes, interrupted=False):
     if changed:
         for result in results:
             result['eligible'] = False
-    aggregate = {'study_id': manifest['study_id'], 'interrupted': interrupted,
+    aggregate = {'study_id': manifest['study_id'], 'suite': suite, 'interrupted': interrupted,
                  'source_changed': changed, 'results': results,
                  'validation_protocol': 'native context only; cross-context comparison is whole-configuration comparison'}
     save_result(out / 'results.json', aggregate)
-    columns = ['case', 'gpu', 'context_length', 'batch_size', 'learning_rate', 'status', 'eligible',
+    stop_fields = ['train_stop_reason', 'train_stop_elapsed_seconds', 'train_stop_remaining_seconds',
+                   'train_stop_last_step_seconds', 'train_stop_step_safety_seconds', 'train_stop_reserve_seconds']
+    phase_fields = ['encode_seconds', 'train_seconds', 'save_seconds', 'validation_seconds']
+    columns = ['case', 'gpu', 'context_length', 'batch_size', 'learning_rate',
+               'optimizer_beta1', 'optimizer_beta2', 'weight_decay', 'max_grad_norm',
+               'tokens_per_step', 'warmup_steps', 'cosine_steps', 'warmup_target_tokens', 'cosine_target_tokens',
+               'status', 'eligible',
                'run_id', 'wandb_url', 'val_ppl', 'val_loss', 'validation_targets', 'final_step',
                'target_tokens', 'tokens_per_second', 'peak_allocated_bytes', 'peak_reserved_bytes',
-               'total_seconds', 'exit_code']
+               'total_seconds', 'exit_code', *phase_fields, *stop_fields]
     rows = []
     for result in results:
         case = result['case']
         summary = result.get('summary', {})
-        rows.append({**CASES[case], 'case': case, 'gpu': result['assigned_gpu'],
+        parameters = case_parameters(case)
+        beta1, beta2 = parameters.pop('optimizer_betas')
+        tokens_per_step = parameters['batch_size'] * parameters['context_length']
+        rows.append({**parameters, 'case': case, 'gpu': result['assigned_gpu'],
+                     'optimizer_beta1': beta1, 'optimizer_beta2': beta2,
+                     'tokens_per_step': tokens_per_step,
+                     'warmup_target_tokens': tokens_per_step * parameters['warmup_steps'],
+                     'cosine_target_tokens': tokens_per_step * parameters['cosine_steps'],
                      'status': result['status'], 'eligible': result['eligible'],
                      'run_id': result.get('run_id'), 'wandb_url': result.get('wandb_url'),
                      'val_ppl': summary.get('val/ppl'), 'val_loss': summary.get('val/loss'),
@@ -137,20 +155,27 @@ def collect(out, manifest, exit_codes, interrupted=False):
                      'tokens_per_second': summary.get('train/tokens_per_second'),
                      'peak_allocated_bytes': summary.get('gpu/peak_allocated_bytes'),
                      'peak_reserved_bytes': summary.get('gpu/peak_reserved_bytes'),
-                     'total_seconds': summary.get('time/total_seconds'), 'exit_code': result['exit_code']})
+                     'total_seconds': summary.get('time/total_seconds'), 'exit_code': result['exit_code'],
+                     **{field: summary.get('time/' + field) for field in phase_fields + stop_fields}})
     with (out / 'results.csv').open('w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    lines = ['# 上下文 × 峰值学习率 2×2',
+    title = '# 优化器组合 × 大 batch 性能候选' if suite == 'optimizer-batch' else '# 上下文 × 峰值学习率 2×2'
+    history = ('历史 256 窗口参考：C（batch128、LR3e-4）PPL 45.18785；'
+               'D（batch128、LR6e-4）PPL 41.75639。' if suite == 'optimizer-batch'
+               else '历史基线完整验证 PPL：40.60899；本报告不自动修改 dev。')
+    lines = [title,
              '各组使用自身上下文完成验证；跨上下文比较评价整套配置，不单独归因于训练上下文。',
-             '历史基线完整验证 PPL：40.60899；本报告不自动修改 dev。',
-             '| 组 | GPU | 验证上下文 | batch | 峰值 LR | 状态 | 有效 | 完整验证 PPL | 最终 step | Run |',
-             '|---|---:|---:|---:|---:|---|---|---:|---:|---|']
+             history,
+             '| 组 | GPU | 验证上下文 | batch | 峰值 LR | β₂ | WD | 裁剪 | token/步 | warmup/终点步 | 状态 | 有效 | PPL | 最终 step | Run |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---:|---:|---|']
     for row in rows:
         url = f"[W&B]({row['wandb_url']})" if row['wandb_url'] else '—'
         lines.append(f"| {row['case']} | {row['gpu']} | {row['context_length']} | {row['batch_size']} | "
-                     f"{row['learning_rate']} | {row['status']} | {row['eligible']} | {row['val_ppl']} | "
+                     f"{row['learning_rate']} | {row['optimizer_beta2']} | {row['weight_decay']} | "
+                     f"{row['max_grad_norm']} | {row['tokens_per_step']:,} | "
+                     f"{row['warmup_steps']}/{row['cosine_steps']} | {row['status']} | {row['eligible']} | {row['val_ppl']} | "
                      f"{row['final_step']} | {url} |")
     eligible = [r for r in rows if r['eligible']]
     if eligible:
@@ -159,19 +184,28 @@ def collect(out, manifest, exit_codes, interrupted=False):
                             for r in sorted(eligible, key=lambda r: r['val_ppl']))]
     if changed:
         lines += ['', '启动与结束源码指纹不同，全部结果排除出有效表。']
-    lines += ['', 'B/A、D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 的上下文安排。',
-              '每步均为 32,768 目标 token；相同 step 不表示跨上下文的采样序列相同。',
-              '四 GPU 共享磁盘和主机，吞吐需结合编码耗时、GPU 型号与实际最终 token 数解释。']
+    if suite == 'optimizer-batch':
+        lines += ['', 'E 同时改变三项优化器设置；F 又改变 batch 与峰值 LR，只能评估组合效果。',
+                  '按相同累计目标 token 对照区间 loss，不能按相同步数比较两组训练预算。',
+                  'warmup 均对应 16,384,000 tokens；余弦终点均对应 2,129,920,000 tokens。']
+    else:
+        lines += ['', 'B/A、D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 的上下文安排。']
+    lines += ['', '每步目标 token：' + '，'.join(f"{r['case']}={r['tokens_per_step']:,}" for r in rows) + '。',
+              '相同累计 token 不表示使用相同采样序列；吞吐结合编码耗时、GPU 型号与并发负载解释。',
+              '停训诊断见 results.csv：退出原因、elapsed、剩余预算、最后一步耗时与两倍安全余量。',
+              '保持原停训条件，不自动降低 batch、不做显存预检、不自动修改 dev。']
     (out / 'report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return aggregate
 
 
 def launch(args):
+    settings = SUITES[args.suite]
+    cases = settings['cases']
     if not hasattr(os, 'sched_getaffinity'):
         raise RuntimeError('This launcher requires Linux CPU affinity')
-    if len(args.gpus) != 4 or len(set(args.gpus)) != 4 or any(g < 0 for g in args.gpus):
-        raise ValueError('Exactly four distinct nonnegative GPU indices are required')
-    cpus = allocate_cpus(os.sched_getaffinity(0))
+    if len(args.gpus) != len(cases) or len(set(args.gpus)) != len(cases) or any(g < 0 for g in args.gpus):
+        raise ValueError(f'Suite {args.suite} requires {len(cases)} distinct nonnegative GPU indices')
+    cpus = allocate_cpus(os.sched_getaffinity(0), args.suite)
     selected = {cpu for ids in cpus.values() for cpu in ids}
     os.sched_setaffinity(0, selected)
     out = Path(args.output_dir).resolve()
@@ -192,13 +226,13 @@ def launch(args):
         if not path.is_file():
             raise FileNotFoundError(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(out.parent).free < 100_000_000_000:
-        raise ValueError('At least 100 GB free disk space is required')
+    if shutil.disk_usage(out.parent).free < settings['disk_bytes']:
+        raise ValueError(f'At least {settings["disk_bytes"] // 1_000_000_000} GB free disk space is required')
     out.mkdir(exist_ok=False)
-    manifest = {'study_id': args.study_id, 'created_utc': datetime.now(UTC).isoformat(),
+    manifest = {'study_id': args.study_id, 'suite': args.suite, 'created_utc': datetime.now(UTC).isoformat(),
                 'source_fingerprints': source_fingerprints(), 'cases': {
-                    case: {**CASES[case], 'gpu': gpu, 'cpu_ids': cpus[case]}
-                    for case, gpu in zip(CASES, args.gpus, strict=True)}}
+                    case: {**case_parameters(case), 'gpu': gpu, 'cpu_ids': cpus[case]}
+                    for case, gpu in zip(cases, args.gpus, strict=True)}}
     save_result(out / 'manifest.json', manifest)
     processes, logs, codes = {}, {}, {}
     interrupted = False
@@ -238,13 +272,27 @@ def launch(args):
     return 0 if all(code == 0 for code in codes.values()) else 1
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--gpus', nargs=4, type=int, default=[0, 1, 2, 3])
-    parser.add_argument('--output-dir', default='outputs/context-lr-2x2')
-    parser.add_argument('--study-id', default='context-lr-2x2-' + datetime.now(UTC).strftime('%Y%m%d-%H%M%S'))
-    args = parser.parse_args()
-    raise SystemExit(launch(args))
+    parser.add_argument('--suite', choices=list(SUITES), default='context-lr')
+    parser.add_argument('--gpus', nargs='+', type=int)
+    parser.add_argument('--output-dir')
+    parser.add_argument('--study-id')
+    args = parser.parse_args(argv)
+    settings = SUITES[args.suite]
+    if args.gpus is None:
+        args.gpus = list(settings['gpus'])
+    if args.output_dir is None:
+        args.output_dir = 'outputs/' + settings['output_name']
+    if args.study_id is None:
+        args.study_id = settings['output_name'] + '-' + datetime.now(UTC).strftime('%Y%m%d-%H%M%S')
+    if len(args.gpus) != len(settings['cases']) or len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0:
+        parser.error(f"{args.suite} requires {len(settings['cases'])} distinct nonnegative GPU indices")
+    return args
+
+
+def main():
+    raise SystemExit(launch(parse_args()))
 
 
 if __name__ == '__main__':

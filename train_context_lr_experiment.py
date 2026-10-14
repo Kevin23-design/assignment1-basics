@@ -1,4 +1,4 @@
-"""One fixed context/LR case; start timing before heavy imports or setup."""
+"""One fixed training experiment; start timing before heavy imports or setup."""
 import time
 
 PROGRAM_STARTED_UNIX = time.time()
@@ -21,6 +21,30 @@ CASES = {
     'C': {'context_length': 256, 'batch_size': 128, 'learning_rate': 3e-4},
     'D': {'context_length': 256, 'batch_size': 128, 'learning_rate': 6e-4},
 }
+OPTIMIZER_BATCH_CASES = {
+    'E': {'context_length': 256, 'batch_size': 128, 'learning_rate': 3e-4,
+          'optimizer_betas': (0.9, 0.95), 'weight_decay': .01, 'max_grad_norm': 2.0},
+    'F': {'context_length': 256, 'batch_size': 256, 'learning_rate': 6e-4,
+          'optimizer_betas': (0.9, 0.95), 'weight_decay': .01, 'max_grad_norm': 2.0,
+          'warmup_steps': 250, 'cosine_steps': 32500},
+}
+ALL_CASES = {**CASES, **OPTIMIZER_BATCH_CASES}
+SUITES = {
+    'context-lr': {'cases': CASES, 'gpus': [0, 1, 2, 3], 'cpu_offset': 0,
+                   'disk_bytes': 100_000_000_000, 'output_name': 'context-lr-2x2'},
+    'optimizer-batch': {'cases': OPTIMIZER_BATCH_CASES, 'gpus': [2, 3], 'cpu_offset': 32,
+                        'disk_bytes': 50_000_000_000, 'output_name': 'optimizer-batch-2gpu'},
+}
+
+
+def case_parameters(case):
+    return {'optimizer_betas': (0.9, 0.999), 'weight_decay': .1, 'max_grad_norm': 1.0,
+            'warmup_steps': 500, 'cosine_steps': 65000, **ALL_CASES[case]}
+
+
+def case_suite(case):
+    return 'optimizer-batch' if case in OPTIMIZER_BATCH_CASES else 'context-lr'
+
 THREAD_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'BLIS_NUM_THREADS')
 
@@ -51,16 +75,16 @@ def prepare_environment(cpu_ids, visible_gpu):
 
 def case_config(base, case, cpu_ids, study_id, out):
     config = dict(base)
-    config.update(CASES[case])
     config.update({
         'experiment_case': case, 'experiment_series': study_id,
+        'experiment_suite': case_suite(case),
         'context_lr_cpu_ids': cpu_ids, 'output_dir': str(Path(out).resolve()),
         'train_file': '/data/assignment1-data/owt_train.txt',
         'valid_file': '/data/assignment1-data/owt_valid.txt',
         'bpe_prefix': str(ROOT / 'outputs/e9275a3b4a7a/tokenizer'),
         'device': 'cuda:0', 'precision': 'bf16', 'num_layers': 4, 'd_model': 512,
         'num_heads': 8, 'd_ff': 1408, 'rope_theta': 10000, 'seed': 42,
-        'eval_batch_size': 16, 'validation_context_length': CASES[case]['context_length'],
+        'eval_batch_size': 16, 'validation_context_length': ALL_CASES[case]['context_length'],
         'expected_validation_targets': 66401097,
         'min_learning_rate': 3e-5, 'warmup_steps': 500, 'cosine_steps': 65000,
         'optimizer_betas': (0.9, 0.999), 'optimizer_eps': 1e-8,
@@ -70,6 +94,10 @@ def case_config(base, case, cpu_ids, study_id, out):
         'max_train_seconds': 21600, 'reserve_seconds': 600,
         'resume': None, 'resume_from_run': None, 'previous_elapsed_seconds': 0.,
     })
+    config.update(case_parameters(case))
+    config['tokens_per_step'] = config['batch_size'] * config['context_length']
+    config['warmup_target_tokens'] = config['warmup_steps'] * config['tokens_per_step']
+    config['cosine_target_tokens'] = config['cosine_steps'] * config['tokens_per_step']
     return config
 
 
@@ -109,6 +137,7 @@ def execute(args):
     prepare_environment(args.cpu_ids, os.environ.get('CUDA_VISIBLE_DEVICES', ''))
     out.mkdir(parents=True, exist_ok=False)
     result = {'case': args.case, 'study_id': args.study_id, 'gpu_visible': os.environ['CUDA_VISIBLE_DEVICES'],
+              'suite': case_suite(args.case),
               'cpu_ids': args.cpu_ids, 'status': 'initializing', 'summary': {}, 'source_recorded': False}
     save_result(out / 'result.json', result)
 
@@ -136,10 +165,10 @@ def execute(args):
 
         @contextmanager
         def recorded_experiment(task, config):
-            with experiment('transformer-context-lr-exploration', config, root=ROOT) as run:
+            task_name = f'transformer-{case_suite(args.case)}-exploration'
+            with experiment(task_name, config, root=ROOT) as run:
                 result['source_recorded'] = True
                 run.name = f"{os.environ['STUDENT_ID']}-{args.study_id}-{args.case}"
-                run.group = f"{os.environ['STUDENT_ID']}-{args.study_id}"
                 result.update({'run_id': run.id, 'wandb_url': run.url, 'status': 'running'})
                 save_result(out / 'result.json', result)
                 try:
@@ -178,11 +207,14 @@ def execute(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--case', choices=list(CASES), required=True)
+    parser.add_argument('--case', choices=list(ALL_CASES), required=True)
+    parser.add_argument('--suite', choices=list(SUITES), help='Optional; inferred from --case when omitted')
     parser.add_argument('--cpu-ids', type=int, nargs=16, required=True)
     parser.add_argument('--study-id', required=True)
     parser.add_argument('--output-dir', required=True)
     args = parser.parse_args()
+    if args.suite is not None and args.case not in SUITES[args.suite]['cases']:
+        parser.error('--case does not belong to the selected --suite')
     execute(args)
 
 

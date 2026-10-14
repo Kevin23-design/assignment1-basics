@@ -312,7 +312,17 @@ def train_model(config, run):
 
     training_started = time.perf_counter()
     while True:
-        if time.perf_counter() + reserve + 2 * last_step_seconds >= deadline:
+        stop_checked_at = time.perf_counter()
+        if stop_checked_at + reserve + 2 * last_step_seconds >= deadline:
+            run.summary.update({
+                "time/train_stop_reason": "reserve_plus_two_last_steps",
+                "time/train_stop_elapsed_seconds": config["previous_elapsed_seconds"]
+                + stop_checked_at - PROGRAM_STARTED_CLOCK,
+                "time/train_stop_remaining_seconds": deadline - stop_checked_at,
+                "time/train_stop_last_step_seconds": last_step_seconds,
+                "time/train_stop_step_safety_seconds": 2 * last_step_seconds,
+                "time/train_stop_reserve_seconds": reserve,
+            })
             break
         started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
