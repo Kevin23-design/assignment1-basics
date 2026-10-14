@@ -8,6 +8,10 @@ import os
 # 在 NumPy/PyTorch 导入前限制底层计算线程；保留环境中更小的配额。
 CPU_THREADS = min(16, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
 if __name__ == "__main__":
+    # cuda:0 指向唯一可见 GPU；用户可在启动时指定物理编号或 UUID。
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, set(sorted(os.sched_getaffinity(0))[:16]))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ[name] = str(min(CPU_THREADS, max(1, int(os.environ.get(name, CPU_THREADS)))))
 
@@ -19,11 +23,17 @@ from itertools import islice
 import json
 import math
 from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import torch
 
 from bpe import BPE
+from parallel_bpe_encoding import THREAD_VARS, affinity
 from transformer_module import AdamW, TransformerLM, cross_entropy, get_batch, get_lr_cosine_schedule, gradient_clipping
 from wandb_record import experiment
 
@@ -32,9 +42,13 @@ ROOT = Path(__file__).resolve().parent
 MODEL_KEYS = ("context_length", "d_model", "num_layers", "num_heads", "d_ff", "rope_theta")
 # 只在这里填写路径和训练配置；运行命令不需要额外参数。
 CONFIG = {
-    "train_file": str(ROOT / "data/owt_train.txt"),
-    "valid_file": str(ROOT / "data/owt_valid.txt"),
-    "bpe_prefix": str(ROOT / "outputs/830f59c92e15/tokenizer"),
+    "train_file": "/data/assignment1-data/owt_train.txt",
+    "valid_file": "/data/assignment1-data/owt_valid.txt",
+    "bpe_prefix": str(ROOT / "outputs/e9275a3b4a7a/tokenizer"),
+    "bpe_encode_workers": 16,
+    "bpe_worker_cache_capacity": 1_048_576,
+    "bpe_cache_policy": "clear_all",
+    "bpe_split_special_token": "<|endoftext|>",
     "device": "cuda:0",  # 用 CUDA_VISIBLE_DEVICES 在启动命令中选择 GPU。
     "precision": "bf16",
     "num_layers": 4,
@@ -104,6 +118,73 @@ def encode_file(bpe, source, destination, deadline):
     return np.memmap(destination, mode="r", dtype="<u4")
 
 
+def encoding_cpus(workers):
+    if not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("BPE worker 数须在 1..16 范围内")
+    if not hasattr(os, "sched_getaffinity"):
+        raise RuntimeError("正式多进程编码需要 Linux CPU affinity")
+    cpus = sorted(os.sched_getaffinity(0))[:workers]
+    if len(cpus) != workers:
+        raise ValueError(f"需要 {workers} 个 CPU，当前配额只有 {len(cpus)} 个，不自动降配")
+    return cpus
+
+
+def encode_file_parallel(config, source, destination, deadline):
+    """重新编码原文；无 GPU 的协调进程退出后才返回磁盘 token 数组。"""
+    check_deadline(deadline)
+    workers = config["bpe_encode_workers"]
+    cpus = encoding_cpus(workers)
+    affinity(cpus, include_descendants=True)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # 不能复用先前编码产物；与原 encode_file 一样重新写入完整数组。
+    destination.unlink(missing_ok=True)
+    environment = os.environ.copy()
+    environment.update({name: "1" for name in THREAD_VARS})
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    with tempfile.TemporaryDirectory(prefix="bpe-job-", dir=destination.parent) as temporary:
+        folder = Path(temporary)
+        job = {"source": str(source), "tokenizer_prefix": config["bpe_prefix"],
+               "destination": str(destination), "workers": workers,
+               "capacity": config["bpe_worker_cache_capacity"],
+               "separator": config["bpe_split_special_token"], "cpus": cpus, "deadline": deadline}
+        (folder / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        command = [sys.executable, str(ROOT / "parallel_bpe_encoding.py"),
+                   "--job", str(folder / "job.json"), "--result", str(folder / "result.json")]
+        process = subprocess.Popen(command, env=environment, start_new_session=True)
+        try:
+            while process.poll() is None:
+                check_deadline(deadline)
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.returncode:
+                raise RuntimeError(f"BPE 编码子进程失败，退出码 {process.returncode}")
+            check_deadline(deadline)
+            result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+            if result["status"] != "ok":
+                raise ValueError(f"无法安全分为 {workers} 片：{result.get('reason')}")
+            if result["token_count"] < 2 or destination.stat().st_size != result["token_count"] * 4:
+                raise ValueError("编码结果不足两个 token 或 uint32 文件大小错误")
+        except BaseException:
+            # 整个子进程组包含协调进程及其 spawn worker；异常不得留下后台编码。
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            destination.unlink(missing_ok=True)
+            Path(str(destination) + ".partial").unlink(missing_ok=True)
+            shutil.rmtree(Path(str(destination) + ".parts"), ignore_errors=True)
+            raise
+    return np.memmap(destination, mode="r", dtype="<u4")
+
+
 def validation_batches(tokens, context_length, batch_size, device):
     """每个目标 token 恰好计分一次；尾部补位只用于组批，不计入损失。"""
     for first in range(0, len(tokens) - 1, context_length * batch_size):
@@ -159,8 +240,14 @@ def train_model(config, run):
         }
     )
     # 正式路径始终编码完整原文，编码与续训的耗时都计入累计预算。
-    train = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
-    valid = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
+    if config.get("bpe_encode_workers", 1) > 1:
+        run.config.update({"bpe_cpu_affinity": encoding_cpus(config["bpe_encode_workers"]),
+                           "bpe_worker_threads": 1, "bpe_worker_gpu_visible": False})
+        train = encode_file_parallel(config, config["train_file"], out / "train.tokens", deadline)
+        valid = encode_file_parallel(config, config["valid_file"], out / "valid.tokens", deadline)
+    else:
+        train = encode_file(bpe, config["train_file"], out / "train.tokens", deadline)
+        valid = encode_file(bpe, config["valid_file"], out / "valid.tokens", deadline)
     run.config.update({"train_token_count": len(train), "valid_token_count": len(valid)})
     if len(train) <= config["context_length"]:
         raise ValueError("训练数据长度必须超过上下文长度")
@@ -275,6 +362,11 @@ def train_model(config, run):
 
 def main():
     config = CONFIG.copy()
+    workers = config.get("bpe_encode_workers", 1)
+    if not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("BPE worker 数须在 1..16 范围内")
+    if config.get("bpe_encode_workers", 1) > 1:
+        affinity(encoding_cpus(config["bpe_encode_workers"]), include_descendants=True)
     # ~ 使用实际登录用户的 home；相对路径以项目目录为基准。
     for key in ("train_file", "valid_file", "bpe_prefix", "resume", "output_dir"):
         if config.get(key):

@@ -1,15 +1,14 @@
 # BPE 与 Transformer 作业
 
-保留五个核心文件：`bpe.py`、`train_bpe.py`、`transformer_module.py`、
-`transformer_main.py` 和课程提供的 `wandb_record.py`。
+正式源码包括 `bpe.py`、`train_bpe.py`、`transformer_module.py`、
+`transformer_main.py`、`parallel_bpe_encoding.py` 和课程提供的 `wandb_record.py`。
 模型核心、BPE 和课程源码记录器保持不变。
 
 ## 环境与运行
 
 ```sh
-uv python pin 3.13
-uv sync --locked
-uv run wandb login
+source /env/activate_a1.sh
+wandb login
 export WANDB_ENTITY="你的实际账号或团队"
 export WANDB_PROJECT="lmfs-assignment1"
 export STUDENT_ID="你的学号"
@@ -20,7 +19,7 @@ export PYTHONIOENCODING="utf-8"
 任务一入口：
 
 ```sh
-uv run python train_bpe.py
+python train_bpe.py
 ```
 
 完整文本编码保留 **1,048,576 项、满后整体清空** 的缓存；只缓存不超过 128 字符的
@@ -35,12 +34,33 @@ uv run python train_bpe.py
 任务二只修改 `transformer_main.py` 顶部的 `CONFIG` 字典，然后在项目根目录执行：
 
 ```sh
-uv run python transformer_main.py
+CUDA_VISIBLE_DEVICES=0 python transformer_main.py
 ```
 
 不再使用命令行参数、开发清单、梯度累积或自动验证耗时估算。
 配置中的原始训练和验证文件必须是完整 OWT 文件。分词器默认指向本人已训练的
-`outputs/830f59c92e15/tokenizer`；迁移时携带同前缀的 vocab、merges、config 三个 JSON 文件。
+`outputs/e9275a3b4a7a/tokenizer`；迁移时携带同前缀的 vocab、merges、config 三个 JSON 文件。
+
+原文默认读取 `/data/assignment1-data/owt_train.txt` 和 `owt_valid.txt`。
+公共环境只激活使用，不执行 `uv sync` 或修改依赖。
+
+正式编码采用云端已确认的 **16 workers × 每 worker 1,048,576 项、满后清空**：
+验证集三轮中位数 7.356 秒；完整训练集一次确认 183.402 秒，8 workers 为 336.431 秒。
+两种训练集配置均通过完整 ID 对照和原文字节还原，16 workers 的产物 SHA-256 与参考相同。
+这些是探索成绩，新的正式运行仍从入口计时，重新编码完整 train/valid，包含启动、分片、
+读写、合并与清理时间，不加载探索产物跳过编码。
+
+`CONFIG` 中的 `bpe_encode_workers=16`、`bpe_worker_cache_capacity=1048576` 和
+`bpe_split_special_token="<|endoftext|>"` 控制编码。Linux 当前可用逻辑 CPU 少于配置数量
+时直接报错，不自动降配。整个程序 CPU affinity 最多 16 个 CPU，worker 各绑定一个 CPU，
+内部线程为 1 且看不到 GPU；协调进程和所有 worker 退出后才初始化模型。父进程保留一张
+可见 GPU，`CUDA_VISIBLE_DEVICES` 可指定物理编号或 UUID，代码始终使用 `cuda:0`。
+W&B 配置记录 worker 数、容量、策略与实际 CPU 集合，源码记录器同时包含辅助模块。
+
+只能在分词器实际识别到的完整特殊 token 之后分片；不足所需非空分片时正式运行报错。
+六小时截止检查覆盖切点扫描、worker 读写、等待和拼接，异常清理临时分片，不进入训练。
+默认 BPE `encode_iterable()` 仍保持原有 2K 缓存；`bpe_encode_workers=1` 使用原单进程
+路径，供调试与兼容旧配置。续训继续使用原 run 的分词器及模型配置。
 
 模型配置为 4 层、512 维、8 头、FFN 1408、上下文 512、BF16。
 batch 64，即每次更新 32,768 token，面向 A100/A800 80GB，尚未在该卡上确认吞吐。
@@ -69,5 +89,5 @@ AdamW β=(0.9,0.999)、权重衰减 0.1、梯度裁剪 1.0。
 继续使用原分词器、数据、模型和优化器配置；程序不再自动核对其哈希和配置一致性。
 每次启动仍重新编码原文，耗时计入累计预算，不使用免计时的开发缓存。
 
-测试：`uv run pytest`。提交一份 Markdown 文档，包含姓名、学号、两项正式 W&B 链接，
-有续训时附关联运行。此前 PPL 64.75 是验证前缀的开发成绩，不能当作完整验证成绩。
+测试：`python -m pytest`。提交一份 Markdown 文档，包含姓名、学号、两项正式 W&B 链接，
+有续训时附关联运行。
