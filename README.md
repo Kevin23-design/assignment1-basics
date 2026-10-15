@@ -432,3 +432,94 @@ W&B job type 为 `transformer-optimizer-batch-exploration`，每组一个 run，
 python -m pytest tests/test_optimizer_batch_suite.py tests/test_context_lr_experiments.py \
   tests/test_training.py tests/test_optimizer.py tests/test_train_bpe.py tests/test_tokenizer.py -q
 ```
+
+## 任务一：完整 encode/decode/比较效率探索
+
+`benchmark_task1_efficiency.py` 与 `task1_memory_encoding.py` 是独立实验工具。
+不修改默认 `BPE.encode()`、`decode()`、流式接口或任务二写盘流程；复用已有 tokenizer，
+不重新训练词表。此实验输出最终内存 `list[int]`，总耗时包含全文 encode、全文 decode
+和原文精确比较。任务二的编码写盘成绩不能作为本实验成绩。
+
+云端激活公共环境、配置自己的 W&B 后，在 exploration 项目目录执行：
+
+```sh
+source /env/activate_a1.sh
+
+python benchmark_task1_efficiency.py \
+  --tokenizer-prefix outputs/e9275a3b4a7a/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --workers 1 2 4 8 16 \
+  --repeats 3 \
+  --diagnostics \
+  --output-dir outputs/task1-efficiency
+```
+
+输出目录必须不存在。默认使用当前允许的前 16 个逻辑 CPU；不足请求的 worker 数时
+直接报错，不自动降配。可以加 `--cpu-ids` 指定 16 个允许且空闲的 CPU 编号，避免与正在
+训练的实验共用 CPU；实验期间也应避免其他高负载任务影响比较。GPU 隐藏，所有底层线程
+变量为 1，父进程、后台记录服务及 worker 限制在所选 CPU 集合内，整个实验最多 16 核。
+标准单进程基线使用其中首个 CPU，并行配置使用前 N 个。资源数量会记录到结果中。
+
+计时前：加载新的父分词器、读取完整 UTF-8 文本（保留 CR/LF）。计时内：计算安全切点、
+启动全新 spawn workers、加载 worker 分词器、文本复制/IPC、普通 BPE 编码、uint32 ID
+返回、有序组装完整 Python list、worker 退出、全文解码、原文比较。缓存均为 1M、满后
+清空、仅缓存不超过 128 字符的片段，从空开始；不在计时前建池、分片或编码验证集。
+同一 worker 在本次验证内处理后续任务时可以自然使用已有缓存。
+
+分片直接在已加载文本中匹配完整特殊 token 清单，遵守生产实现的匹配优先级，只在真实
+分隔 token 后切分。默认 `--separator '<|endoftext|>'`，它须在 tokenizer 配置中。
+包含关系不会通过任意子串搜索处理。重复切点合并，不足所需非空分片时标记 unavailable，
+不按任意字符或字节截断普通片段。
+
+自动分阶段执行：
+
+1. 原版单进程 S 与 P1/P2/P4/P8/P16，各三次，固定种子交错，共 18 次完整验证。
+   按总耗时中位数选优，距最快 3% 以内优先较少 worker，单进程与 P1 接近时优先原版。
+2. 并行胜出时，固定 worker 数，比较每 worker 1/2/4 个任务，各三次；单进程胜出则跳过。
+   本阶段以最快中位数选择分片粒度。
+3. 固定编码方案，比较原版解码与 64K/256K/1M 个 ID 的 bytes 分块拼接，各三次。
+   所有 bytes 块拼接后仅做一次 UTF-8 decode，不能逐块独立解码。以完整总耗时中位数选优。
+4. `--diagnostics` 另跑原版和选定配置，记录缓存查询/命中/清空，并生成 parent/worker
+   `.prof` 文件。诊断时间不排名。最后在新进程、空缓存下做一次独立确认。
+
+默认流程在并行胜出时共 40 次正常比较/确认，加一次独立参考生成，另有最多两次诊断；
+单进程胜出时跳过 9 次分片粒度比较。所有候选串行运行，不并发相互抢资源。
+
+正常计时外，对每个候选与参考进行完整 uint32 ID 对照，要求 **66,401,098** 个 ID 全部
+一致，并生成前 200 token 的 ID、hex、逐项解码、字节位置和匹配信息。任一还原失败或
+ID 不一致立即停止。默认参考由独立子进程的原版 BPE 生成，临时参考文件在结束或 Python
+异常时清理；参考生成行的 ID 对照字段为空，表示尚不适用。参考实例缓存不参与候选运行。
+已有可信且与当前数据/分词器匹配的参考时，可附加：
+
+```sh
+--reference-tokens outputs/6bb24d46a473/valid.tokens
+```
+
+参考文件只读，启动时验证大小，记录 SHA-256；候选仍全部逐项精确比较。运行过程中只在
+计时外读写参考，不使用 token 写盘途径返回候选。进程失败或用户中断时会终止并等待编码
+worker；外层子进程组提供额外清理。公共原文和 tokenizer 始终只读。
+
+一个 `bpe-task1-efficiency-exploration` W&B run 保存完整源码和 Table。Summary 中
+`bpe/valid_seconds` 是**独立确认**的完整耗时，不是从重复实验中挑出的最短单次值。
+前 200 token 也来自该确认。每个候选的分阶段、总耗时、正确性、CPU、RSS 均记录到本地
+结果；分片/启动/编码及 IPC/组装分项位于逐次 JSON 和 CSV。编码与传输重叠的阶段不能
+解释为纯 BPE 计算时间；worker RSS 之和不是同时发生的实际峰值。
+
+输出目录包含输入/源码指纹与环境的 `manifest.json`、参考信息、执行顺序、逐次 job/结果/
+日志、`results.json`、`results.csv`、`report.md`、`selection.json`、`integrity.json` 和
+W&B 链接。诊断 `.prof` 可用标准库 pstats 或 cProfile 工具单独分析；不把诊断时间当成绩。
+若源码或输入前后 SHA-256 变化，整个探索标记失败。
+
+本轮只比较既定词表的实现效率，不证明词表来自完整 OWT 训练集；
+`submission_provenance_verified=false` 明确保留此限制。完成探索后再决定是否接入正式
+任务一入口，不自动替换实现，不将本工具当成完整训练与提交来源证明。
+
+本地小文本测试（不运行完整 OWT）：
+
+```sh
+python -m pytest tests/test_task1_efficiency.py tests/test_train_bpe.py \
+  tests/test_tokenizer.py tests/test_parallel_bpe_experiment.py -q
+```
+
+`--development --no-wandb` 仅供小 fixture，可在 macOS 跳过 affinity；该模式不作为课程
+实验材料，不修改公共环境依赖。
