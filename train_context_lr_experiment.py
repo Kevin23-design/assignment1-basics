@@ -28,22 +28,48 @@ OPTIMIZER_BATCH_CASES = {
           'optimizer_betas': (0.9, 0.95), 'weight_decay': .01, 'max_grad_norm': 2.0,
           'warmup_steps': 250, 'cosine_steps': 32500},
 }
-ALL_CASES = {**CASES, **OPTIMIZER_BATCH_CASES}
+BEST_LR_REFERENCE_CASES = {
+    'G': {'context_length': 512, 'batch_size': 64, 'learning_rate': 6e-4},
+    'H': {'context_length': 512, 'batch_size': 64, 'learning_rate': 1e-3},
+    'I': {'context_length': 256, 'batch_size': 128, 'learning_rate': 1e-2,
+          'num_heads': 16, 'd_ff': 1344, 'min_learning_rate': 1e-3, 'warmup_steps': 6500,
+          'optimizer_betas': (0.9, 0.95), 'weight_decay': .01, 'max_grad_norm': 1.0, 'seed': 1337},
+}
+REFERENCE_REVISION = 'c7bd4a373c1c56fc6cb02cc3f848c13d02a2b825'
+REFERENCE_ROOT = f'https://github.com/donglinkang2021/cs336-assignment1-basics/blob/{REFERENCE_REVISION}'
+REFERENCE_ADAPTATION = {
+    'name': '参考仓库六小时适配版', 'revision': REFERENCE_REVISION,
+    'model_url': REFERENCE_ROOT + '/conf/model/default.yaml',
+    'optimizer_url': REFERENCE_ROOT + '/conf/optimizer/default.yaml',
+    'training_url': REFERENCE_ROOT + '/conf/training/default.yaml',
+    'owt_url': REFERENCE_ROOT + '/scripts/openwebtext_learning_rate.sh',
+    'entry_url': REFERENCE_ROOT + '/train.py',
+    'profile': 'OWT sweep candidate LR0.01; actual executed clipping1.0, not configured2.0',
+    'differences': ['10000-step budget replaced by six-hour budget and cosine endpoint65000',
+                    'warmup6500 and min_lr0.001 preserve the original 10% ratios',
+                    'own BPE, initialization and sampling implementation; BF16',
+                    'full native-context validation; no intermediate validation or best-checkpoint selection'],
+}
+ALL_CASES = {**CASES, **OPTIMIZER_BATCH_CASES, **BEST_LR_REFERENCE_CASES}
 SUITES = {
     'context-lr': {'cases': CASES, 'gpus': [0, 1, 2, 3], 'cpu_offset': 0,
                    'disk_bytes': 100_000_000_000, 'output_name': 'context-lr-2x2'},
     'optimizer-batch': {'cases': OPTIMIZER_BATCH_CASES, 'gpus': [2, 3], 'cpu_offset': 32,
                         'disk_bytes': 50_000_000_000, 'output_name': 'optimizer-batch-2gpu'},
+    'best-lr-reference': {'cases': BEST_LR_REFERENCE_CASES, 'gpus': [1, 2, 3], 'cpu_offset': 16,
+                          'disk_bytes': 75_000_000_000, 'output_name': 'best-lr-reference-3gpu'},
 }
 
 
 def case_parameters(case):
     return {'optimizer_betas': (0.9, 0.999), 'weight_decay': .1, 'max_grad_norm': 1.0,
-            'warmup_steps': 500, 'cosine_steps': 65000, **ALL_CASES[case]}
+            'warmup_steps': 500, 'cosine_steps': 65000, 'min_learning_rate': 3e-5,
+            'num_layers': 4, 'd_model': 512, 'num_heads': 8, 'd_ff': 1408, 'seed': 42,
+            **ALL_CASES[case]}
 
 
 def case_suite(case):
-    return 'optimizer-batch' if case in OPTIMIZER_BATCH_CASES else 'context-lr'
+    return next(name for name, settings in SUITES.items() if case in settings['cases'])
 
 THREAD_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'BLIS_NUM_THREADS')
@@ -95,6 +121,8 @@ def case_config(base, case, cpu_ids, study_id, out):
         'resume': None, 'resume_from_run': None, 'previous_elapsed_seconds': 0.,
     })
     config.update(case_parameters(case))
+    if case == 'I':
+        config['reference_adaptation'] = REFERENCE_ADAPTATION
     config['tokens_per_step'] = config['batch_size'] * config['context_length']
     config['warmup_target_tokens'] = config['warmup_steps'] * config['tokens_per_step']
     config['cosine_target_tokens'] = config['cosine_steps'] * config['tokens_per_step']

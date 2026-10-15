@@ -14,7 +14,9 @@ import subprocess
 import sys
 import time
 
-from train_context_lr_experiment import ROOT, SUITES, case_parameters, case_suite, eligible_result, save_result
+from train_context_lr_experiment import (
+    REFERENCE_ADAPTATION, ROOT, SUITES, case_parameters, case_suite, eligible_result, save_result,
+)
 
 SKIP = {'.git', '.venv', 'venv', 'outputs', 'wandb', 'data', 'datasets',
         'checkpoints', '__pycache__', '.pytest_cache'}
@@ -123,11 +125,15 @@ def collect(out, manifest, exit_codes, interrupted=False):
     aggregate = {'study_id': manifest['study_id'], 'suite': suite, 'interrupted': interrupted,
                  'source_changed': changed, 'results': results,
                  'validation_protocol': 'native context only; cross-context comparison is whole-configuration comparison'}
+    if suite == 'best-lr-reference':
+        aggregate['reference_adaptation'] = REFERENCE_ADAPTATION
+        aggregate['comparison_groups'] = {'512': ['G', 'H'], '256': ['I']}
     save_result(out / 'results.json', aggregate)
     stop_fields = ['train_stop_reason', 'train_stop_elapsed_seconds', 'train_stop_remaining_seconds',
                    'train_stop_last_step_seconds', 'train_stop_step_safety_seconds', 'train_stop_reserve_seconds']
     phase_fields = ['encode_seconds', 'train_seconds', 'save_seconds', 'validation_seconds']
     columns = ['case', 'gpu', 'context_length', 'batch_size', 'learning_rate',
+               'min_learning_rate', 'num_layers', 'd_model', 'num_heads', 'd_ff', 'seed',
                'optimizer_beta1', 'optimizer_beta2', 'weight_decay', 'max_grad_norm',
                'tokens_per_step', 'warmup_steps', 'cosine_steps', 'warmup_target_tokens', 'cosine_target_tokens',
                'status', 'eligible',
@@ -161,16 +167,33 @@ def collect(out, manifest, exit_codes, interrupted=False):
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    title = '# 优化器组合 × 大 batch 性能候选' if suite == 'optimizer-batch' else '# 上下文 × 峰值学习率 2×2'
+    titles = {'context-lr': '# 上下文 × 峰值学习率 2×2',
+              'optimizer-batch': '# 优化器组合 × 大 batch 性能候选',
+              'best-lr-reference': '# 最佳配置复测、学习率对照与参考仓库六小时适配版'}
+    title = titles[suite]
     history = ('历史 256 窗口参考：C（batch128、LR3e-4）PPL 45.18785；'
                'D（batch128、LR6e-4）PPL 41.75639。' if suite == 'optimizer-batch'
                else '历史基线完整验证 PPL：40.60899；本报告不自动修改 dev。')
+    if suite == 'best-lr-reference':
+        history = ('历史 512 窗口最佳 B：PPL 40.18098；256 窗口 C/D/E/F：'
+                   '45.18785 / 41.75639 / 47.00493 / 43.51419。')
     lines = [title,
              '各组使用自身上下文完成验证；跨上下文比较评价整套配置，不单独归因于训练上下文。',
              history,
              '| 组 | GPU | 验证上下文 | batch | 峰值 LR | β₂ | WD | 裁剪 | token/步 | warmup/终点步 | 状态 | 有效 | PPL | 最终 step | Run |',
              '|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---:|---:|---|']
+    header = lines[-2:]
+    if suite == 'best-lr-reference':
+        lines = lines[:-2]
+        lines += ['', '模型与调度配置：', '',
+                  '| 组 | 层数 | 维度 | 头数 | FFN | 最低 LR | seed |',
+                  '|---|---:|---:|---:|---:|---:|---:|']
+        lines += [f"| {r['case']} | {r['num_layers']} | {r['d_model']} | {r['num_heads']} | "
+                  f"{r['d_ff']} | {r['min_learning_rate']} | {r['seed']} |" for r in rows]
+        lines += ['', '## 512 窗口：G/H 主对照', '', *header]
     for row in rows:
+        if suite == 'best-lr-reference' and row['case'] == 'I':
+            lines += ['', '## 256 窗口：I 整套配置探索', '', *header]
         url = f"[W&B]({row['wandb_url']})" if row['wandb_url'] else '—'
         lines.append(f"| {row['case']} | {row['gpu']} | {row['context_length']} | {row['batch_size']} | "
                      f"{row['learning_rate']} | {row['optimizer_beta2']} | {row['weight_decay']} | "
@@ -178,7 +201,13 @@ def collect(out, manifest, exit_codes, interrupted=False):
                      f"{row['warmup_steps']}/{row['cosine_steps']} | {row['status']} | {row['eligible']} | {row['val_ppl']} | "
                      f"{row['final_step']} | {url} |")
     eligible = [r for r in rows if r['eligible']]
-    if eligible:
+    if eligible and suite == 'best-lr-reference':
+        for context in (512, 256):
+            group = sorted((r for r in eligible if r['context_length'] == context), key=lambda r: r['val_ppl'])
+            if group:
+                lines += ['', f'有效结果（仅 {context} 窗口）：' + ', '.join(
+                    f"{r['case']}: {r['val_ppl']:.5f}" for r in group)]
+    elif eligible:
         lines += ['', '## 有效配置按完整验证 PPL 排序',
                   ', '.join(f"{r['case']}: {r['val_ppl']:.5f}（验证窗口 {r['context_length']}）"
                             for r in sorted(eligible, key=lambda r: r['val_ppl']))]
@@ -188,6 +217,15 @@ def collect(out, manifest, exit_codes, interrupted=False):
         lines += ['', 'E 同时改变三项优化器设置；F 又改变 batch 与峰值 LR，只能评估组合效果。',
                   '按相同累计目标 token 对照区间 loss，不能按相同步数比较两组训练预算。',
                   'warmup 均对应 16,384,000 tokens；余弦终点均对应 2,129,920,000 tokens。']
+    elif suite == 'best-lr-reference':
+        lines += ['', 'G/H 只改变峰值 LR；I 同时改变模型、优化器、调度、上下文和 seed，只评价组合效果。',
+                  f"参考版本：`{REFERENCE_ADAPTATION['revision']}`；[OWT 配置]({REFERENCE_ADAPTATION['owt_url']})；"
+                  f"[实际训练入口]({REFERENCE_ADAPTATION['entry_url']})。",
+                  'I 使用公开代码实际裁剪 1.0，非脚本声明的 2.0；仅参考配置，不移植核心实现。',
+                  'I 的 10K 步调度延长到 65K，warmup6500、最低 LR0.001；属于六小时适配版，不是完整复现。',
+                  '保留本人 BPE、BF16、现有初始化与采样、完整验证，不增加中间验证。',
+                  '三组不因达到 65K 停训；终点后保持各自最低 LR。',
+                  '同 token 附近的训练区间 loss 为辅助证据；单次实验不声称统计显著。']
     else:
         lines += ['', 'B/A、D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 的上下文安排。']
     lines += ['', '每步目标 token：' + '，'.join(f"{r['case']}={r['tokens_per_step']:,}" for r in rows) + '。',
@@ -233,6 +271,8 @@ def launch(args):
                 'source_fingerprints': source_fingerprints(), 'cases': {
                     case: {**case_parameters(case), 'gpu': gpu, 'cpu_ids': cpus[case]}
                     for case, gpu in zip(cases, args.gpus, strict=True)}}
+    if args.suite == 'best-lr-reference':
+        manifest['reference_adaptation'] = REFERENCE_ADAPTATION
     save_result(out / 'manifest.json', manifest)
     processes, logs, codes = {}, {}, {}
     interrupted = False

@@ -94,7 +94,7 @@ def test_launcher_import_is_stdlib_only():
     assert result.returncode == 0
 
 
-@pytest.mark.parametrize('case', ['A', 'E', 'F'])
+@pytest.mark.parametrize('case', ['A', 'E', 'F', 'G', 'H', 'I'])
 def test_live_run_capture_and_entry_time(monkeypatch, tmp_path, case):
     root = tmp_path
     output = root / 'outputs' / case
@@ -110,7 +110,7 @@ def test_live_run_capture_and_entry_time(monkeypatch, tmp_path, case):
     torch = SimpleNamespace(cuda=cuda, set_num_threads=lambda n: None, set_num_interop_threads=lambda n: None)
     trainer = SimpleNamespace(CONFIG={}, torch=torch)
     summary = completed_result()['summary'].copy()
-    run = SimpleNamespace(id='run', summary=summary, url='https://example.com/run')
+    run = SimpleNamespace(id='run', summary=summary, url='https://example.com/run', group='student')
     @contextmanager
     def record(task, config, root):
         assert task == f'transformer-{runner.case_suite(case)}-exploration'
@@ -134,7 +134,8 @@ def test_live_run_capture_and_entry_time(monkeypatch, tmp_path, case):
     result = json.loads((output / 'result.json').read_text())
     assert result['eligible'] and result['status'] == 'completed'
     assert events == [('device', 0), ('reset', 0), ('training', case)]
-    assert run.name == f'student-study-{case}' and run.group == 'student-study'
+    assert run.name == f'student-study-{case}' and run.group == 'student'
+    assert result['config']['experiment_series'] == 'study'
 
 
 def test_collect_keeps_failure_isolated(monkeypatch, tmp_path):

@@ -677,3 +677,74 @@ python -m pytest tests/test_task1_transport.py tests/test_task1_efficiency.py \
 
 `--development --no-wandb --repeats 1` 仅供小 fixture，默认两个 worker（可用
 `--development-workers` 调整），允许 macOS 跳过 Linux affinity；不作为课程性能材料。
+
+## 下一轮任务二：最佳配置、学习率与参考仓库适配
+
+`exploration` 新增 `best-lr-reference` suite，保留旧 A–F 入口与配置，`dev` 不变。
+当前最佳有效参考为 B 的完整验证 PPL **40.18098**（512 窗口）。E/F 的 PPL 为
+47.00493 / 43.51419，batch 翻倍时吞吐仅提高约 2.7%，本轮不继续扩大 batch。
+
+| 参数 | G：最佳 B 复测 | H：提高峰值 LR | I：参考仓库六小时适配版 |
+|---|---:|---:|---:|
+| GPU | 1 | 2 | 3 |
+| 层数 / d_model | 4 / 512 | 4 / 512 | 4 / 512 |
+| 注意力头数 / FFN | 8 / 1408 | 8 / 1408 | 16 / 1344 |
+| 训练与验证 context / batch | 512 / 64 | 512 / 64 | 256 / 128 |
+| 每步目标 token | 32,768 | 32,768 | 32,768 |
+| 峰值 / 最低 LR | 6e-4 / 3e-5 | 1e-3 / 3e-5 | 1e-2 / 1e-3 |
+| warmup / 余弦终点 step | 500 / 65,000 | 500 / 65,000 | 6,500 / 65,000 |
+| AdamW β | (0.9, 0.999) | (0.9, 0.999) | (0.9, 0.95) |
+| weight decay / 裁剪 | 0.1 / 1.0 | 0.1 / 1.0 | 0.01 / 1.0 |
+| seed | 42 | 42 | 1337 |
+
+共同设置为 BF16、RoPE θ=10,000、AdamW ε=1e-8、eval batch 16、六小时预算和
+600 秒收尾预留。调度终点仍指全局 step 65,000，此后保持最低 LR，不按步数提前结束。
+G/H 只改变峰值 LR；I 同时改变多项条件和 seed，只评估整套配置。
+
+参考仓库固定版本 `c7bd4a373c1c56fc6cb02cc3f848c13d02a2b825`：
+[OWT 扫描配置](https://github.com/donglinkang2021/cs336-assignment1-basics/blob/c7bd4a373c1c56fc6cb02cc3f848c13d02a2b825/scripts/openwebtext_learning_rate.sh)、
+[实际训练入口](https://github.com/donglinkang2021/cs336-assignment1-basics/blob/c7bd4a373c1c56fc6cb02cc3f848c13d02a2b825/train.py)。
+I 选择扫描中的 LR0.01、β₂0.95、WD0.01；裁剪按实际代码 **1.0**，不是脚本声明的 2.0。
+原本 10K 步调度扩展到 65K，保留 10% warmup 和最低 LR 比例。保留本人 BPE、BF16、
+现有初始化与采样、完整验证，不增加中间验证或按最佳中间成绩挑选检查点。
+仅参考配置，不移植核心实现；此组不称为完全复现。来源、固定版本和适配差异写入 I 的
+W&B 配置以及本地 manifest/results/report。
+
+云端运行（预先配置个人 W&B 环境变量）：
+
+```bash
+source /env/activate_a1.sh
+
+python launch_context_lr_experiments.py \
+  --suite best-lr-reference \
+  --gpus 1 2 3 \
+  --output-dir outputs/best-lr-reference-3gpu
+```
+
+默认 GPU 与上述命令相同。CPU 分配沿用排序后允许 CPU 的前 64 核：G 使用第 17–32 核，
+H 第 33–48 核，I 第 49–64 核，共互斥使用 48 核；不足 64 个允许 CPU 直接失败。
+每组硬限制 16 核，各自只看到一张 GPU，内部为 cuda:0。编码保持 16 workers、每 worker
+1M 清空缓存、内部线程 1、GPU 隐藏；所有编码 worker 退出后才初始化模型。
+输出目录必须不存在，磁盘预检至少 **75 GB**；公共数据只读，不修改共享依赖。
+
+各组从自己的入口顶部计时，重新用 `outputs/e9275a3b4a7a/tokenizer` 编码公共完整 OWT
+原文，从随机权重训练，不复用历史 token 文件或检查点。每组独立日志、产物和 W&B run，
+job type 为 `transformer-best-lr-reference-exploration`，共用配置中的 experiment_series；
+W&B group 保持课程记录器的学号分组，不新增启动器 run。
+不做 GPU 试训，不自动降 batch；单组 OOM、非有限 loss、验证失败或超时不停止其他组。
+中断启动器会终止并回收所属进程，保留原截止检查及停训诊断。
+
+沿用区间 loss/PPL/LR、累计目标 token、吞吐、峰值显存、各阶段和总耗时记录。
+每组要求完整验证 **66,401,097** 个目标，尾部计分。G/H 的 512 窗口结果和 I 的
+256 窗口结果分表展示，不混成同口径排名。I 可参考历史同窗口 C/D/E/F，但差异不能
+归因于独立参数；相同累计 token 附近的区间训练 loss 仅为辅助证据。
+仅源码未变、完整验证成功且累计不超过六小时的结果有效；不声称单次结果统计显著，
+不自动修改 dev，也不提前认定 LR0.01 有效。
+
+本地仅运行小规模测试：
+
+```bash
+python -m pytest tests/test_best_lr_reference_suite.py tests/test_context_lr_experiments.py \
+  tests/test_optimizer_batch_suite.py tests/test_training.py tests/test_optimizer.py \
+  tests/test_tokenizer.py tests/test_train_bpe.py tests/test_parallel_bpe_experiment.py -q
+```
