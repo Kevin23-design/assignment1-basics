@@ -1,8 +1,8 @@
 # BPE 与 Transformer 作业
 
 正式源码包括 `bpe.py`、`train_bpe.py`、`transformer_module.py`、
-`transformer_main.py`、`parallel_bpe_encoding.py` 和课程提供的 `wandb_record.py`。
-模型核心、BPE 和课程源码记录器保持不变。
+`transformer_main.py`、`parallel_bpe_encoding.py`、`bpe_memory_runtime.py` 和课程提供的 `wandb_record.py`。
+模型核心、BPE 训练/合并规则和课程源码记录器保持不变。
 
 ## 环境与运行
 
@@ -23,13 +23,45 @@ python train_bpe.py
 ```
 
 完整文本编码保留 **1,048,576 项、满后整体清空** 的缓存；只缓存不超过 128 字符的
-普通预分词片段。正式入口的 W&B 配置记录 `clear_all` 与实际缓存容量。
+普通预分词片段。正式入口保持课程提供的固定配置与 encode/decode 调用流程。
 流式 `encode_iterable()` 继续使用独立的 2,048 项缓存。
 
 云端三轮缓存探索中，1M 清空策略中位数为 41.499 秒；1M 停止新增为 41.728 秒，
 1M LRU 为 51.577 秒，全部通过完整 ID 对照与全文还原。1M 实际缓存 627,462 项，
 未触发容量上限，因此本次无法比较它与停止新增策略在满后的行为。当前继续保留原策略。
 以上是探索结果，最终提交仍使用正式 W&B 验证记录。
+
+任务一正式入口 `train_bpe.py` 按课程模板保留：先训练并保存、重新加载、读取全文，
+再计时执行 `bpe.encode(text)`、`bpe.decode(ids)` 和原文比较；前 200 token 展示及上传
+在计时后。数据路径固定为公共 OWT 原文，运行 `python train_bpe.py`，不附加路径或 worker
+参数。最优参数现已封装在 `BPE` 内部：**16 workers / 256 个安全分片 / 131,072 IDs 解码块**。
+`encode()` 仍返回完整 `list[int]`，`decode()` 先拼接全部 bytes，再进行一次 UTF-8 解码，
+非法序列使用 `errors="replace"`。不修改公开接口或特殊 token 的序列化格式。
+
+大于等于 8 Mi 字符的完整文本在 Linux 上自动尝试并行；切点只能在分词器实际识别到的
+完整特殊 token 后，遵守较长标记优先，不限于某个写死的标记。OWT 默认特殊清单仅包含
+`<|endoftext|>`，其 256 分片口径与探索相同。小输入、没有足够安全切点、非 Linux 环境
+或超出 uint32 范围的自定义 ID 保留串行编码行为。能够安全分片而允许 CPU 不足 16 个时
+明确报错，不自动减核；worker 运行失败也不会悄悄串行重跑。
+
+父进程及记录服务限定在前 16 个允许的逻辑 CPU 内，worker 各固定一个。独立轻量协调
+入口使用 `multiprocessing` 的 spawn 上下文启动 worker，避免重复导入模板顶层的 W&B；
+子进程启动环境在导入前设置底层线程为 1、隐藏 GPU，调用者的 GPU 可见性和线程环境
+变量不变。worker 从当前词表、合并规则和完整特殊清单重建空缓存 BPE，不依赖磁盘前缀
+继续存在，不缓存进程池。原文、分片和 uint32 结果均通过内存 IPC，不生成临时 token 文件；
+协调、启动、状态传输、全部 worker 退出、有序列表组装都包含在 `encode()` 中。
+
+配对探索中位数从 12.608628 秒降到 12.012227 秒（耗时降低 4.73%，5/5 对胜出）。
+**12.012227 秒仍是辅助实现的探索结果，不代表原样正式入口的新成绩。** 兼容模板新增的
+轻量协调与传输也会计入正式耗时，必须在云端用 `python train_bpe.py` 重新完成训练、
+加载、编码、解码和比较，再以本次 W&B 的 `bpe/valid_seconds` 评分。
+探索工具继续保留在 `exploration` 分支，任务二的流式编码与训练配置不变。
+
+本地仅小文本检查：
+
+```sh
+python -m pytest tests/test_bpe_memory_runtime.py tests/test_tokenizer.py tests/test_train_bpe.py -q
+```
 
 任务二只修改 `transformer_main.py` 顶部的 `CONFIG` 字典，然后在项目根目录执行：
 
