@@ -166,9 +166,9 @@ def worker(args):
         if tokenizer._cache:
             raise RuntimeError('Timing must start with an empty cache')
         t0 = time.perf_counter()
-        ids = tokenizer.encode(text)
+        ids = tokenizer._encode_serial(text)
         t1 = time.perf_counter()
-        decoded = tokenizer.decode(ids)
+        decoded = b"".join(map(tokenizer.vocab.__getitem__, ids)).decode("utf-8", errors="replace")
         t2 = time.perf_counter()
         passed = decoded == text
         t3 = time.perf_counter()

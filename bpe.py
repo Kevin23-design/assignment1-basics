@@ -16,6 +16,11 @@ _BYTES = tuple(bytes([i]) for i in range(256))
 # 完整文本编码：容量探索后保留 1M 项，满后整体清空。
 CACHE_CAPACITY = 1_048_576
 _STREAM_CACHE_CAPACITY = 2048  # 流式编码独立限制为 2K 项。
+_ENCODE_WORKERS = 16
+_PARTITIONS_PER_WORKER = 16
+_DECODE_BLOCK_SIZE = 131072
+# 小输入避免进程启动开销；完整 OWT 验证集远大于该门槛。
+_PARALLEL_MIN_CHARACTERS = 8 << 20
 
 
 class _DescendingPair(tuple):
@@ -206,6 +211,16 @@ class BPE:
         return ids
 
     def encode(self, text: str) -> list[int]:
+        if len(text) >= _PARALLEL_MIN_CHARACTERS and self._special_re:
+            from bpe_memory_runtime import encode_if_parallel
+
+            ids = encode_if_parallel(self, text, _ENCODE_WORKERS, _PARTITIONS_PER_WORKER)
+            if ids is not None:
+                return ids
+        return self._encode_serial(text)
+
+    def _encode_serial(self, text):
+        """相同的预分词和合并实现；worker 直接调用，避免递归启动进程。"""
         ids = []
         extend = ids.extend
         encode_piece = self._encode_uncached
@@ -238,7 +253,13 @@ class BPE:
                 yield from self._encode_piece(piece)
 
     def decode(self, ids: list[int]) -> str:
-        return b"".join(map(self.vocab.__getitem__, ids)).decode("utf-8", errors="replace")
+        lookup = self.vocab.__getitem__
+        if len(ids) <= _DECODE_BLOCK_SIZE:
+            return b"".join(map(lookup, ids)).decode("utf-8", errors="replace")
+        blocks = (b"".join(map(lookup, ids[start:start + _DECODE_BLOCK_SIZE]))
+                  for start in range(0, len(ids), _DECODE_BLOCK_SIZE))
+        # token 甚至 bytes 块的边界都可能位于一个 UTF-8 字符内部。
+        return b"".join(blocks).decode("utf-8", errors="replace")
 
     def save(self, path_prefix: str) -> None:
         prefix = Path(path_prefix)

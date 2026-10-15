@@ -85,7 +85,7 @@ def _worker(worker_id, cpu, prefix, jobs, output, diagnostic, profile_dir):
             encoding_at = time.perf_counter() if diagnostic else None
             if profiler:
                 profiler.enable()
-            ids = tokenizer.encode(text)
+            ids = tokenizer._encode_serial(text)
             packing_at = time.perf_counter() if diagnostic else None
             token_count = len(ids)
             packed = array('I', ids)

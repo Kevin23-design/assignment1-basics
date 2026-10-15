@@ -1,8 +1,8 @@
 # BPE 与 Transformer 作业
 
 正式源码包括 `bpe.py`、`train_bpe.py`、`transformer_module.py`、
-`transformer_main.py`、`parallel_bpe_encoding.py` 和课程提供的 `wandb_record.py`。
-模型核心、BPE 和课程源码记录器保持不变。
+`transformer_main.py`、`parallel_bpe_encoding.py`、`bpe_memory_runtime.py` 和课程提供的 `wandb_record.py`。
+模型核心、BPE 训练/合并规则和课程源码记录器保持不变。
 
 ## 环境与运行
 
@@ -23,7 +23,7 @@ python train_bpe.py
 ```
 
 完整文本编码保留 **1,048,576 项、满后整体清空** 的缓存；只缓存不超过 128 字符的
-普通预分词片段。正式入口的 W&B 配置记录 `clear_all` 与实际缓存容量。
+普通预分词片段。正式入口保持课程模板；缓存策略与容量由本人 BPE 源码记录。
 流式 `encode_iterable()` 继续使用独立的 2,048 项缓存。
 
 云端三轮缓存探索中，1M 清空策略中位数为 41.499 秒；1M 停止新增为 41.728 秒，
@@ -583,3 +583,97 @@ JSON 和 `.prof`。本地报告包含正常测速的中位数/范围/内存、�
 python -m pytest tests/test_task1_refinement.py tests/test_task1_efficiency.py \
   tests/test_train_bpe.py tests/test_tokenizer.py tests/test_parallel_bpe_experiment.py -q
 ```
+
+## 任务一：正式接口接入层探索（B / R / S / D）
+
+`exploration` 选择性同步正式 run `8b68b68e0cbe` 对应的 BPE、运行辅助模块及课程原样
+`train_bpe.py`，保留已有探索工具。新实验只复用词表，不训练，不改 `dev`，不改合并规则。
+旧缓存/单核工具显式调用串行核心和原有全文 bytes 解码；旧并行 helper 的 worker 也显式
+串行，防止新版 BPE 的自动并行改变历史对照或启动嵌套 worker。
+
+```sh
+source /env/activate_a1.sh
+
+python benchmark_task1_transport.py \
+  --tokenizer-prefix outputs/8b68b68e0cbe/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-transport-exploration
+```
+
+输出目录必须不存在且位于个人项目 `outputs`。可选
+`--reference-tokens outputs/6bb24d46a473/valid.tokens`；未提供时，独立串行进程生成临时
+uint32 参考，在正常退出或 Python 异常时删除。参考文件只读，记录 SHA-256 和长度。
+分词器前缀的三个 JSON 必须存在；默认前缀是本次正式运行保存的词表。
+
+固定参数：**16 workers、256 个安全分片、每 worker 1M 满后清空缓存、131,072 IDs 解码块**。
+所有正常测速调用 `BPE.encode(text)` → 完整 `list[int]` → `BPE.decode(ids)` → 原文比较。
+输入读取和父分词器加载在计时前；分片、输入/共享内存准备、状态传输、进程启动/退出、
+完整列表组装和资源释放均计入；ID 对照、前 200 token 及上传在计时后。
+各次使用全新试验子进程和空缓存，不保留进程池。试验进程计时前导入 W&B 以匹配课程
+调用环境，但不创建自己的 run；worker 的独立轻量入口不导入 W&B、NumPy 或 PyTorch。
+为选择实验后端，运行模块在计时前统一导入，manifest 明确记录；不提前准备数据或启动
+worker。最终确认仍属于本探索的调用环境，不替代原样课程入口的正式运行成绩。
+
+| 后端 | 正常路径 |
+|---|---|
+| B | 未改动的正式 runtime：全文传给协调进程，全部 worker 退出后转发结果。 |
+| R | 相同输入路径；协调进程每收到一个分片就转发，调用者接受乱序并按原顺序组装。 |
+| S | 共享输入与每 worker 一个可复用 uint32 输出槽，协调进程只转发控制描述信息。 |
+| D | 调用进程直接管理独立轻量 Python worker；每个 worker 至多一个在途任务，动态分发、直接收取结果。 |
+
+S 按既有安全字符分片分别进行 UTF-8 编码，形成共享输入和字节范围，worker 严格解码自己
+的范围。每个输出槽容量为最大分片原始 UTF-8 字节数的四倍：token 数不超过原始字节数，
+**不依赖参考 token 数预分配**。调用者复制结果后 ACK，收到 ACK 后才可复用对应槽；乱序
+分片保存在调用者自身内存中。所有共享段由调用者创建、关闭和 unlink，其他进程仅以
+`track=False` 附加。S 要求 Python 3.13+；在候选自身计时范围内检查 `/dev/shm` 可用空间，
+实际输入和输出槽需求之外预留 64 MiB。版本或容量不满足时记录 `unavailable`，不偷偷
+回退成管道版本；已启动后的 worker 异常仍中止整个实验。
+
+全程在同一 CPU 集合串行比较，默认取允许的前 16 个逻辑 CPU；不足 16 核直接报错。
+可用 `--cpu-ids` 指定恰好 16 个允许且空闲的编号。父进程、记录服务、协调进程和 worker
+都限制在这组 CPU 内，每个 worker 固定一个，底层线程为 1、GPU 隐藏；不使用 `fork`。
+原文与参考始终只读，正常候选不产生 token 文件，共享内存无持久 token 产物。
+
+默认流程（固定种子逐轮交错）：
+
+1. 先对 B 做一次独立诊断，不参与排名。
+2. B/R/S/D 各测 5 次，共 20 次；S 不可用时记录原因并排除其选优资格。
+3. 对中位数最快的候选另做一次独立诊断。
+4. 候选与 B 再做 5 对全新进程复测，每对随机先后顺序，共 10 次。
+5. 候选必须中位数改善至少 3%，且赢得至少 4/5 对，才推荐替换；否则保留 B。
+   候选仍为 B 时不把噪声当成改进。
+6. 对最终推荐方案另做一次独立确认；W&B `bpe/valid_seconds` 取这一次实际完整耗时，
+   不取历史值、中位数或最短单次作为确认成绩。
+
+完整默认流程为 **31 次正常测速 + 2 次诊断**；未提供参考文件时再加一次串行参考生成。
+每个成功候选必须恰好返回 **66,401,098** 个 ID，通过全部 ID 精确对照与全文还原；
+任一正确性失败立即停止。进程异常或 SIGINT/SIGTERM 时回收所属进程组，并释放共享段，
+不返回部分列表。源码/输入指纹前后不一致时不生成有效选优结论。
+
+诊断默认不启用 cProfile，单独记录安全分片、共享准备、启动、请求发送、首结果到达、
+等待/接收、列表组装、worker 编码/打包/发送、完成时间差、退出、共享释放以及解码/比较。
+保存各 worker 实际任务分布、affinity、线程/GPU 环境和内存；send/receive 含序列化、
+阻塞或等待，不是纯通信成本，跨进程重叠时间不能相加。逻辑载荷统计按 UTF-8/uint32
+计算，不冒充实测 pickle 线上字节数。S 和 D 是整套实现比较，调度也有差异，不能将全部
+收益归因于减少复制。B 正常路径不增加探针，worker RSS 不可得时留空；独立 B 诊断使用
+同样的屏障/转发结构加阶段探针，诊断耗时不当成正常测速。
+
+一个 `bpe-task1-transport-exploration` W&B run 保存完整源码、配置、候选 Table 和逐次
+结果。个人输出目录保存 `manifest.json`、指纹、顺序、逐次 job/日志/结果、参考信息、
+`results.json`、`results.csv`、`report.md`、`selection.json`、`integrity.json` 和 W&B 链接。
+推荐结论与配对明细见 `selection.json`，失败原因见 `failure.json` 和对应 trial 日志。
+18.437 秒与 12.012 秒只作历史参考，本轮与重新测量的 B 配对，不自动更新 `dev`，也不
+承诺恢复到 12 秒；本探索不证明原词表的训练来源。
+
+本地仅小文本与回归测试，不执行完整 OWT：
+
+```sh
+python -m pytest tests/test_task1_transport.py tests/test_task1_efficiency.py \
+  tests/test_task1_refinement.py tests/test_bpe_cache_experiment.py \
+  tests/test_parallel_bpe_experiment.py tests/test_tokenizer.py tests/test_train_bpe.py -q
+```
+
+`--development --no-wandb --repeats 1` 仅供小 fixture，默认两个 worker（可用
+`--development-workers` 调整），允许 macOS 跳过 Linux affinity；不作为课程性能材料。

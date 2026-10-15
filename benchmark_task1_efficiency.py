@@ -88,7 +88,7 @@ def measure(text, tokenizer, spec, prefix, separator, cpus, diagnostic=False, pr
     try:
         started = time.perf_counter()
         if spec['method'] == 'single':
-            ids = tokenizer.encode(text)
+            ids = tokenizer._encode_serial(text)
         else:
             ids, details = encode_parallel_memory(
                 text, tokenizer, prefix, spec['workers'], spec['partitions_per_worker'], separator,
@@ -100,7 +100,7 @@ def measure(text, tokenizer, spec, prefix, separator, cpus, diagnostic=False, pr
             if diagnostic:
                 details['decode_diagnostics'] = decode_diagnostics
         else:
-            decoded = tokenizer.decode(ids)
+            decoded = b"".join(map(tokenizer.vocab.__getitem__, ids)).decode("utf-8", errors="replace")
         decoded_at = time.perf_counter()
         passed = decoded == text
         ended_at = time.perf_counter()
