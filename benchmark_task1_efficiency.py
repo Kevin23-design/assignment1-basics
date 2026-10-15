@@ -95,7 +95,10 @@ def measure(text, tokenizer, spec, prefix, separator, cpus, diagnostic=False, pr
                 cpus, diagnostic=diagnostic, profile_dir=profile_dir)
         encoded_at = time.perf_counter()
         if spec['decode_block_size']:
-            decoded = decode_blocked(tokenizer, ids, spec['decode_block_size'])
+            decode_diagnostics = {} if diagnostic else None
+            decoded = decode_blocked(tokenizer, ids, spec['decode_block_size'], diagnostics=decode_diagnostics)
+            if diagnostic:
+                details['decode_diagnostics'] = decode_diagnostics
         else:
             decoded = tokenizer.decode(ids)
         decoded_at = time.perf_counter()
@@ -211,6 +214,69 @@ def schedule(specs, repeats, seed):
     return result
 
 
+def paired_decision(baseline_rows, candidate_rows, repeats, minimum_gain=.03):
+    """Require complete matched rounds, >=3% median improvement and >=80% paired wins."""
+    if any(len(rows) != repeats for rows in (baseline_rows, candidate_rows)):
+        raise ValueError('Paired confirmation needs every baseline and candidate repeat')
+    groups = []
+    for rows in (baseline_rows, candidate_rows):
+        if any(row['status'] != 'ok' or row.get('diagnostic') or not row.get('roundtrip_passed')
+               or row.get('ids_match_reference') is not True for row in rows):
+            raise ValueError('Paired confirmation requires normal, exact, successful trials')
+        group = {row['repeat']: row for row in rows}
+        if set(group) != set(range(1, repeats + 1)):
+            raise ValueError('Paired confirmation has missing or duplicate rounds')
+        groups.append(group)
+    baseline, candidate = groups
+    before = statistics.median(row['total_seconds'] for row in baseline_rows)
+    after = statistics.median(row['total_seconds'] for row in candidate_rows)
+    wins = sum(candidate[index]['total_seconds'] < baseline[index]['total_seconds'] for index in baseline)
+    required_wins = (4 * repeats + 4) // 5
+    promote = after <= before * (1 - minimum_gain) and wins >= required_wins
+    return {'promote_candidate': promote, 'baseline_median_seconds': before,
+            'candidate_median_seconds': after, 'median_improvement_fraction': 1 - after / before,
+            'paired_wins': wins, 'required_paired_wins': required_wins,
+            'minimum_improvement_fraction': minimum_gain,
+            'paired_seconds': [{'repeat': index, 'baseline': baseline[index]['total_seconds'],
+                               'candidate': candidate[index]['total_seconds']} for index in sorted(baseline)],
+            'reason': 'threshold_and_consistency_passed' if promote else 'retain_current_configuration'}
+
+
+def run_refinement(args, trial):
+    baseline = {'method': 'parallel', 'workers': max(args.workers), 'partitions_per_worker': 4,
+                'decode_block_size': 262144}
+    selections = {'baseline': baseline}
+    variants = [{**baseline, 'decode_block_size': size} for size in sorted(set(args.decode_block_sizes))]
+    group = [trial('refine-decoder', spec, repeat)
+             for spec, repeat in schedule(variants, args.repeats, args.seed)]
+    selected, median = choose(group, args.repeats, tolerance=0.)
+    selections['decoder'] = {**selected, 'median_seconds': median}
+    variants = [{**selected, 'partitions_per_worker': size} for size in sorted(set(args.partition_multipliers))]
+    group = [trial('refine-partitions', spec, repeat)
+             for spec, repeat in schedule(variants, args.repeats, args.seed + 1)]
+    candidate, median = choose(group, args.repeats, tolerance=0.)
+    selections['partitions'] = {**candidate, 'median_seconds': median}
+    if args.diagnostics:
+        trial('diagnostic-baseline', baseline, diagnostic=True)
+        trial('diagnostic-candidate', candidate, diagnostic=True)
+    baseline_rows, candidate_rows = [], []
+    rng = random.Random(args.seed + 2)
+    for repeat in range(1, args.repeats + 1):
+        pair = [('baseline', baseline, baseline_rows), ('candidate', candidate, candidate_rows)]
+        rng.shuffle(pair)
+        for label, spec, rows in pair:
+            rows.append(trial('paired-' + label, spec, repeat))
+    decision = paired_decision(baseline_rows, candidate_rows, args.repeats)
+    if config_key(candidate) == config_key(baseline):
+        decision.update(promote_candidate=False, reason='candidate_matches_current_configuration')
+    selections['paired_confirmation'] = decision
+    promoted = decision['promote_candidate']
+    selected = candidate if promoted else baseline
+    # Keep one actual independent run as the reported task-one score; never report the best trial.
+    confirmation = (candidate_rows if promoted else baseline_rows)[-1]
+    return selected, selections, confirmation
+
+
 def write_report(out, rows, selections):
     fields = ['stage', 'repeat', 'method', 'workers', 'partitions_per_worker', 'decode_block_size',
               'status', 'diagnostic', 'total_seconds', 'encode_seconds', 'decode_seconds', 'compare_seconds',
@@ -247,7 +313,22 @@ def write_report(out, rows, selections):
             stats = row.get('cache_diagnostics', {})
             lines.append(f"| {row['method']} | {row['workers']} | {stats.get('queries')} | "
                          f"{stats.get('hit_rate', 0):.2%} | {stats.get('clears')} |")
+        for row in diagnostics:
+            lines += ['', f"### {row.get('trial_id', row['stage'])}：分项诊断", '```json',
+                      json.dumps({key: row[key] for key in ('pipeline_diagnostics', 'decode_diagnostics')
+                                  if key in row}, ensure_ascii=False, indent=2), '```']
+            if row.get('worker_metadata'):
+                lines += ['', '| worker | 任务 | 字符数 | token 数 | 编码(s) | 打包(s) | send(s) | 取任务等待(s) |',
+                          '|---:|---:|---:|---:|---:|---:|---:|---:|']
+                for item in row['worker_metadata']:
+                    lines.append(f"| {item['worker_id']} | {item['tasks']} | {item.get('characters', '—')} | "
+                                 f"{item.get('tokens', '—')} | {item.get('encode_seconds', 0):.3f} | "
+                                 f"{item.get('pack_seconds', 0):.3f} | {item.get('send_seconds', 0):.3f} | "
+                                 f"{item.get('job_wait_seconds', 0):.3f} |")
     lines += ['', 'worker_encode_ipc_join_seconds 是重叠阶段墙钟时间，不是纯合并计算时间。',
+              '局部精调只有配对中位数改善至少 3% 且至少 80% 配对获胜时才推荐候选；否则保留当前配置。',
+              '诊断的 send 包含序列化及阻塞，receive 包含等待及反序列化；各进程耗时不能相加。',
+              '诊断解码为分离查找和拼接而额外物化字节引用，分项仅用于定位，不代表正常解码速度。',
               'worker_peak_rss_sum 是独立进程峰值之和，不是同时发生的实际峰值。',
               'CPU 数量不同的方案比较代表最多 16 核预算下的整套实现收益，不能解释为单核算法提速。',
               '本工具不证明 tokenizer 的完整训练集来源，不自动修改正式实现；不能用任务二写盘成绩代替。']
@@ -298,6 +379,11 @@ def execute(args):
         raise ValueError('Repeats must be positive; worker counts must be 1..16')
     if min(args.partition_multipliers) <= 0 or min(args.decode_block_sizes) <= 0:
         raise ValueError('Partition multipliers and decode blocks must be positive')
+    if args.suite == 'local-refinement' and not args.development:
+        if args.workers != [16] or args.repeats < 5:
+            raise ValueError('Cloud refinement requires 16 workers and at least five repeats')
+        if 262144 not in args.decode_block_sizes or 4 not in args.partition_multipliers:
+            raise ValueError('Refinement must include the current decoder and partition controls')
     if args.cpu_ids is not None and (len(set(args.cpu_ids)) != len(args.cpu_ids) or not 1 <= len(args.cpu_ids) <= 16):
         raise ValueError('--cpu-ids must contain 1..16 distinct logical CPU indices')
     max_workers = max(args.workers)
@@ -346,7 +432,8 @@ def execute(args):
         context = nullcontext(None)
     else:
         from wandb_record import experiment
-        context = experiment('bpe-task1-efficiency-exploration', manifest, root=ROOT)
+        context = experiment('bpe-task1-efficiency-' + ('refinement' if args.suite == 'local-refinement'
+                                                     else 'exploration'), manifest, root=ROOT)
     rows, execution_order, selections = [], [], {}
     original = {'method': 'single', 'workers': 1, 'partitions_per_worker': 1, 'decode_block_size': 0}
     save_json(out / 'results.json', rows)
@@ -385,26 +472,10 @@ def execute(args):
                 expected = Path(reference).stat().st_size // 4
             save_json(out / 'reference.json', {'sha256': sha256(reference), 'token_count': expected,
                                                'provided': bool(args.reference_tokens)})
-            stage1 = [original] + [{'method': 'parallel', 'workers': count, 'partitions_per_worker': 1,
-                                    'decode_block_size': 0} for count in sorted(set(args.workers))]
-            group = [trial('workers', spec, repeat) for spec, repeat in schedule(stage1, args.repeats, args.seed)]
-            selected, median = choose(group, args.repeats)
-            selections['workers'] = {**selected, 'median_seconds': median}
-            if selected['method'] == 'parallel':
-                variants = [{**selected, 'partitions_per_worker': multiplier}
-                            for multiplier in sorted(set([1, *args.partition_multipliers]))]
-                group = [trial('partitions', spec, repeat) for spec, repeat in schedule(variants, args.repeats, args.seed + 1)]
-                selected, median = choose(group, args.repeats, tolerance=0.)
-                selections['partitions'] = {**selected, 'median_seconds': median}
-            variants = [{**selected, 'decode_block_size': size} for size in [0, *sorted(set(args.decode_block_sizes))]]
-            group = [trial('decoder', spec, repeat) for spec, repeat in schedule(variants, args.repeats, args.seed + 2)]
-            selected, median = choose(group, args.repeats, tolerance=0.)
-            selections['decoder'] = {**selected, 'median_seconds': median}
-            if args.diagnostics:
-                trial('diagnostic-original', original, diagnostic=True)
-                if config_key(selected) != config_key(original):
-                    trial('diagnostic-selected', selected, diagnostic=True)
-            confirmation = trial('confirmation', selected)
+            if args.suite == 'local-refinement':
+                selected, selections, confirmation = run_refinement(args, trial)
+            else:
+                selected, selections, confirmation = run_broad_search(args, trial, original)
             if confirmation['status'] != 'ok':
                 raise ValueError('Independent confirmation did not complete successfully')
             changed = [path for path, digest in manifest['input_sha256'].items() if sha256(path) != digest]
@@ -412,7 +483,7 @@ def execute(args):
             save_json(out / 'integrity.json', {'changed_inputs': changed, 'source_changed': source_changed})
             if changed or source_changed:
                 raise ValueError('Source or input changed during exploration; results are not eligible')
-            final = {'completed': True, 'selected': selected, 'selections': selections,
+            final = {'completed': True, 'suite': args.suite, 'selected': selected, 'selections': selections,
                      'confirmation_seconds': confirmation['total_seconds'],
                      'confirmation_trial': confirmation['trial_id'], 'submission_provenance_verified': False}
             save_json(out / 'selection.json', final)
@@ -428,9 +499,17 @@ def execute(args):
                                     'bpe/roundtrip_passed': confirmation['roundtrip_passed'],
                                     'ids_match_reference': confirmation['ids_match_reference'],
                                     'selected_method': selected, 'submission_provenance_verified': False})
+                if args.suite == 'local-refinement':
+                    run.summary['paired_confirmation'] = selections['paired_confirmation']
                 for name in ['manifest.json', 'reference.json', 'results.json', 'results.csv', 'schedule.json',
                              'selection.json', 'integrity.json', 'report.md']:
                     run.save(str(out / name), base_path=str(out), policy='now')
+                if args.diagnostics:
+                    for path in sorted(out.glob('trial-*-profiles/*.prof')):
+                        run.save(str(path), base_path=str(out), policy='now')
+                    for row in rows:
+                        if row['diagnostic']:
+                            run.save(str(out / (row['trial_id'] + '.json')), base_path=str(out), policy='now')
                 save_json(out / 'wandb.json', {'url': run.url})
         except BaseException as error:
             save_json(out / 'failure.json', {'completed': False, 'error': repr(error)})
@@ -440,25 +519,63 @@ def execute(args):
     print(f'Completed: {out / "report.md"}', flush=True)
 
 
+def run_broad_search(args, trial, original):
+    selections = {}
+    stage1 = [original] + [{'method': 'parallel', 'workers': count, 'partitions_per_worker': 1,
+                            'decode_block_size': 0} for count in sorted(set(args.workers))]
+    group = [trial('workers', spec, repeat) for spec, repeat in schedule(stage1, args.repeats, args.seed)]
+    selected, median = choose(group, args.repeats)
+    selections['workers'] = {**selected, 'median_seconds': median}
+    if selected['method'] == 'parallel':
+        variants = [{**selected, 'partitions_per_worker': multiplier}
+                    for multiplier in sorted(set([1, *args.partition_multipliers]))]
+        group = [trial('partitions', spec, repeat) for spec, repeat in schedule(variants, args.repeats, args.seed + 1)]
+        selected, median = choose(group, args.repeats, tolerance=0.)
+        selections['partitions'] = {**selected, 'median_seconds': median}
+    variants = [{**selected, 'decode_block_size': size} for size in [0, *sorted(set(args.decode_block_sizes))]]
+    group = [trial('decoder', spec, repeat) for spec, repeat in schedule(variants, args.repeats, args.seed + 2)]
+    selected, median = choose(group, args.repeats, tolerance=0.)
+    selections['decoder'] = {**selected, 'median_seconds': median}
+    if args.diagnostics:
+        trial('diagnostic-original', original, diagnostic=True)
+        if config_key(selected) != config_key(original):
+            trial('diagnostic-selected', selected, diagnostic=True)
+    confirmation = trial('confirmation', selected)
+    return selected, selections, confirmation
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--suite', choices=['broad', 'local-refinement'], default='broad')
     parser.add_argument('--tokenizer-prefix', default='outputs/e9275a3b4a7a/tokenizer')
     parser.add_argument('--valid-file', default='/data/assignment1-data/owt_valid.txt')
     parser.add_argument('--reference-tokens')
-    parser.add_argument('--workers', nargs='+', type=int, default=[1, 2, 4, 8, 16])
-    parser.add_argument('--repeats', type=int, default=3)
-    parser.add_argument('--partition-multipliers', nargs='+', type=int, default=[1, 2, 4])
-    parser.add_argument('--decode-block-sizes', nargs='+', type=int, default=[65536, 262144, 1048576])
+    parser.add_argument('--workers', nargs='+', type=int)
+    parser.add_argument('--repeats', type=int)
+    parser.add_argument('--partition-multipliers', nargs='+', type=int)
+    parser.add_argument('--decode-block-sizes', nargs='+', type=int)
     parser.add_argument('--separator', default='<|endoftext|>')
     parser.add_argument('--seed', type=int, default=20261015)
     parser.add_argument('--cpu-ids', nargs='+', type=int)
     parser.add_argument('--diagnostics', action='store_true')
-    parser.add_argument('--output-dir', default='outputs/task1-efficiency')
+    parser.add_argument('--output-dir')
     parser.add_argument('--development', action='store_true', help='Small fixtures only; not course submission evidence')
     parser.add_argument('--no-wandb', action='store_true', help='Development tests only')
     parser.add_argument('--worker-job', help=argparse.SUPPRESS)
     parser.add_argument('--worker-result', help=argparse.SUPPRESS)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    refinement = args.suite == 'local-refinement'
+    if args.output_dir is None:
+        args.output_dir = 'outputs/task1-refinement' if refinement else 'outputs/task1-efficiency'
+    if args.workers is None:
+        args.workers = [16] if refinement else [1, 2, 4, 8, 16]
+    if args.repeats is None:
+        args.repeats = 5 if refinement else 3
+    if args.partition_multipliers is None:
+        args.partition_multipliers = [2, 4, 8, 16] if refinement else [1, 2, 4]
+    if args.decode_block_sizes is None:
+        args.decode_block_sizes = [65536, 131072, 262144, 524288] if refinement else [65536, 262144, 1048576]
+    return args
 
 
 def main():

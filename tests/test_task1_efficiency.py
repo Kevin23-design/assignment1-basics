@@ -51,6 +51,11 @@ def test_memory_parallel_exact_ids(tmp_path, workers, multiplier):
     assert len(metrics['worker_metadata']) == workers
     assert metrics['cache_diagnostics']['queries'] > 0
     assert all(item['cache_entries'] <= 1048576 for item in metrics['worker_metadata'])
+    assert sum(item['tokens'] for item in metrics['worker_metadata']) == len(ids)
+    for item in metrics['worker_metadata']:
+        assert len(item['task_diagnostics']) == item['tasks']
+        assert all(item[key] >= 0 for key in ('encode_seconds', 'pack_seconds', 'send_seconds', 'job_wait_seconds'))
+    assert metrics['pipeline_diagnostics']['join_seconds'] >= 0
     assert not list(tmp_path.glob('*.tokens'))
 
 
@@ -60,6 +65,10 @@ def test_blocked_decode_preserves_utf8_and_replacement(block):
     ids = bpe.encode('中文🙂 ab<x>') + [255]
     assert decode_blocked(bpe, ids, block) == bpe.decode(ids)
     assert decode_blocked(bpe, [], block) == ''
+    diagnostics = {}
+    assert decode_blocked(bpe, ids, block, diagnostics=diagnostics) == bpe.decode(ids)
+    assert all(diagnostics[key] >= 0 for key in ('lookup_seconds', 'block_join_seconds',
+                                                'final_join_seconds', 'utf8_seconds'))
     with pytest.raises(ValueError):
         decode_blocked(bpe, ids, 0)
 

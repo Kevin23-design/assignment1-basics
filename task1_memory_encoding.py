@@ -74,26 +74,44 @@ def _worker(worker_id, cpu, prefix, jobs, output, diagnostic, profile_dir):
             tokenizer._cache = DiagnosticCache()
         output.send(('ready', worker_id, None))
         tasks = 0
+        diagnostic_tasks = []
+        active_started = time.perf_counter() if diagnostic else None
         while True:
+            waiting_at = time.perf_counter() if diagnostic else None
             job = jobs.get()
             if job is None:
                 break
             index, text = job
+            encoding_at = time.perf_counter() if diagnostic else None
             if profiler:
                 profiler.enable()
             ids = tokenizer.encode(text)
+            packing_at = time.perf_counter() if diagnostic else None
+            token_count = len(ids)
             packed = array('I', ids)
             if packed.itemsize != 4:
                 raise RuntimeError('Requires 32-bit unsigned array storage')
             del ids
             if profiler:
                 profiler.disable()
+            sending_at = time.perf_counter() if diagnostic else None
             output.send(('part', index, packed))
+            if diagnostic:
+                sent_at = time.perf_counter()
+                diagnostic_tasks.append({'part': index, 'characters': len(text), 'tokens': token_count,
+                                         'job_wait_seconds': encoding_at - waiting_at,
+                                         'encode_seconds': packing_at - encoding_at,
+                                         'pack_seconds': sending_at - packing_at,
+                                         'send_seconds': sent_at - sending_at})
             tasks += 1
         metadata = {'worker_id': worker_id, 'tasks': tasks, 'peak_rss_bytes': rss_bytes(),
                     'cache_entries': len(tokenizer._cache), 'cpu': cpu}
         if diagnostic:
             metadata['cache'] = dict(tokenizer._cache.stats)
+            metadata['task_diagnostics'] = diagnostic_tasks
+            metadata['ready_to_done_seconds'] = time.perf_counter() - active_started
+            for key in ('characters', 'tokens', 'job_wait_seconds', 'encode_seconds', 'pack_seconds', 'send_seconds'):
+                metadata[key] = sum(task[key] for task in diagnostic_tasks)
         if profiler:
             profiler.dump_stats(str(Path(profile_dir) / f'worker-{worker_id:02d}.prof'))
         output.send(('done', worker_id, metadata))
@@ -166,8 +184,14 @@ def encode_parallel_memory(text, tokenizer, prefix, workers, partitions_per_work
         for _ in processes:
             jobs.put(None)
         active = list(receivers)
+        receive_seconds = 0.
+        completed_at = []
         while active:
-            for connection, (kind, index, payload) in _receive(active, processes):
+            receiving_at = time.perf_counter() if diagnostic else None
+            messages = _receive(active, processes)
+            if diagnostic:
+                receive_seconds += time.perf_counter() - receiving_at
+            for connection, (kind, index, payload) in messages:
                 if kind == 'part':
                     if index in parts:
                         raise RuntimeError('Duplicate output partition')
@@ -175,8 +199,11 @@ def encode_parallel_memory(text, tokenizer, prefix, workers, partitions_per_work
                 elif kind == 'done':
                     metadata.append(payload)
                     active.remove(connection)
+                    if diagnostic:
+                        completed_at.append(time.perf_counter() - encoding_started)
                 else:
                     raise RuntimeError('Unexpected encoding worker message')
+        joining_at = time.perf_counter() if diagnostic else None
         for process in processes:
             process.join()
             if process.exitcode:
@@ -199,6 +226,12 @@ def encode_parallel_memory(text, tokenizer, prefix, workers, partitions_per_work
             stats = {key: sum(m['cache'][key] for m in metadata) for key in metadata[0]['cache']}
             stats['hit_rate'] = stats['hits'] / stats['queries'] if stats['queries'] else 0.
             metrics['cache_diagnostics'] = stats
+            metrics['pipeline_diagnostics'] = {
+                'parent_wait_receive_seconds': receive_seconds,
+                'join_seconds': encoding_seconds - (joining_at - encoding_started),
+                'worker_done_spread_seconds': max(completed_at) - min(completed_at),
+                'scope': 'Diagnostic wall times overlap across processes; receive includes wait and unpickle; '
+                         'send includes serialization and pipe blocking. These are not pure IPC costs.'}
         return ids, metrics
     finally:
         for process in processes:
@@ -212,11 +245,36 @@ def encode_parallel_memory(text, tokenizer, prefix, workers, partitions_per_work
         jobs.close()
 
 
-def decode_blocked(tokenizer, ids, block_size):
+def decode_blocked(tokenizer, ids, block_size, diagnostics=None):
     """Concatenate raw bytes blocks, then decode UTF-8 exactly once."""
     if block_size <= 0:
         raise ValueError('Decode block size must be positive')
     lookup = tokenizer.vocab.__getitem__
+    if diagnostics is not None:
+        # Diagnostic-only materialization isolates lookup, block join, final join and UTF-8 conversion.
+        # It deliberately changes allocations, so these timings never enter normal rankings.
+        blocks = []
+        lookup_seconds = join_seconds = 0.
+        for start in range(0, len(ids), block_size):
+            selected = ids[start:start + block_size]
+            began = time.perf_counter()
+            pieces = list(map(lookup, selected))
+            looked_up = time.perf_counter()
+            blocks.append(b''.join(pieces))
+            joined = time.perf_counter()
+            lookup_seconds += looked_up - began
+            join_seconds += joined - looked_up
+            del pieces, selected
+        began = time.perf_counter()
+        raw = b''.join(blocks)
+        joined = time.perf_counter()
+        decoded = raw.decode('utf-8', errors='replace')
+        ended = time.perf_counter()
+        diagnostics.update({'lookup_seconds': lookup_seconds, 'block_join_seconds': join_seconds,
+                            'final_join_seconds': joined - began, 'utf8_seconds': ended - joined,
+                            'scope': 'Diagnostic decomposition materializes byte references per block; '
+                                     'allocation pattern differs from normal decode. Not a speed score.'})
+        return decoded
     blocks = (b''.join(map(lookup, ids[start:start + block_size]))
               for start in range(0, len(ids), block_size))
     return b''.join(blocks).decode('utf-8', errors='replace')

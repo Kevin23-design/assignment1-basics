@@ -523,3 +523,63 @@ python -m pytest tests/test_task1_efficiency.py tests/test_train_bpe.py \
 
 `--development --no-wandb` 仅供小 fixture，可在 macOS 跳过 affinity；该模式不作为课程
 实验材料，不修改公共环境依赖。
+
+### 下一轮：任务一局部精调与配对确认
+
+在 `exploration` 使用同一脚本的 `--suite local-refinement`；不改 `dev`、生产 BPE 或
+任务二入口。当前对照固定为 16 workers、每 worker 平均 4 个任务（共 64 分片）、
+262,144 IDs 解码块、每 worker 1M 清空缓存。上轮完整流程中位数 12.544 秒、独立复测
+12.561 秒只作历史参考，选优使用本轮重新测量的对照。
+
+```sh
+source /env/activate_a1.sh
+
+python benchmark_task1_efficiency.py \
+  --suite local-refinement \
+  --tokenizer-prefix outputs/e9275a3b4a7a/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --diagnostics \
+  --output-dir outputs/task1-refinement
+```
+
+输出目录须不存在。沿用前述最多 16 个逻辑 CPU 的硬限制、GPU 隐藏、线程数 1、独立新
+进程/空缓存、公共数据只读、完整 ID 精确对照和全文还原检查。需要避开其他任务时用
+`--cpu-ids` 指定 16 个允许且空闲的 CPU。云端不允许降到较少 worker 或少于五轮；
+自定义搜索范围时必须包含当前解码块 262,144 与每 worker 4 个任务作为对照。
+
+默认依次执行：
+
+1. 固定 16 workers 和 64 分片，比较解码块 65,536 / 131,072 / 262,144 / 524,288 IDs，
+   各 5 次，逐轮固定种子打乱顺序，共 20 次。按完整流程中位数选择解码块。
+2. 固定选出的解码块，比较每 worker 平均 2 / 4 / 8 / 16 个任务，即 32 / 64 / 128 / 256
+   个安全分片，各 5 次，共 20 次。按完整流程中位数产生候选，分片不足的配置不参与选优。
+3. `--diagnostics` 对当前对照和候选各跑一次，生成 parent/worker `.prof` 及逐任务诊断。
+   即使候选与对照相同，也保留这两次独立诊断，诊断均不参与速度排名。
+4. 在新进程和空缓存下，当前对照与候选再配对运行 5 轮；每轮随机决定先后顺序，共 10 次。
+   只有候选总耗时中位数比对照降低至少 3%，且至少赢得 4/5 对，才推荐候选；否则保留当前
+   配置。配置相同时始终保留当前方案，不把测量噪声解释为改进。
+
+共 50 次正常搜索/确认、2 次可选诊断；未提供 `--reference-tokens` 时，另有一次原版
+参考生成。正式数据的 ID 数必须为 66,401,098，任何 ID 或还原不一致立即停止。
+正常计时始终是完整 encode → 完整 `list[int]` → decode → 原文比较；所有分片、启动、
+worker 加载/退出、通信和列表组装均在其中，不提前建池或预编码。
+
+独立诊断新增 worker 每个任务的字符数、token 数、编码、uint32 打包、send 和取任务等待
+耗时，以及 worker 完成时间差、父进程等待/接收和 join 耗时。send 含序列化和管道阻塞，
+receive 含等待和反序列化，不能视为纯通信成本，各进程的重叠耗时也不能相加。
+解码诊断分别测字节查找、块内拼接、最终拼接和 UTF-8 转换；为分离这些阶段会额外物化
+每块字节引用，因此其分项仅辅助定位，不代表正常解码的准确耗时分解。正常测速不走此路径。
+
+一个新的 `bpe-task1-efficiency-refinement` W&B run 保存源码、完整配置、候选 Table、诊断
+JSON 和 `.prof`。本地报告包含正常测速的中位数/范围/内存、诊断表和配对决定。
+`selection.json` 的 `selections.paired_confirmation` 保存每对耗时、改善幅度、获胜数和
+选优原因；只有正确性通过且源码/输入指纹未变才会写出完成结果。
+`bpe/valid_seconds` 与前 200 token 取最终推荐配置在第 5 对中的实际运行，绝不挑最短值；
+配对中位数另列。实验不会自动把推荐配置接入正式入口。
+
+本地仅运行小文本和编排检查：
+
+```sh
+python -m pytest tests/test_task1_refinement.py tests/test_task1_efficiency.py \
+  tests/test_train_bpe.py tests/test_tokenizer.py tests/test_parallel_bpe_experiment.py -q
+```
