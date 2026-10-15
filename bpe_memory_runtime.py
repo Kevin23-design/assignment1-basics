@@ -1,6 +1,8 @@
 """Private full-text BPE process infrastructure; no W&B, NumPy or model imports.
 
-A clean coordinator prevents spawn from re-executing the caller's training entry.
+Independent lightweight workers avoid re-executing the caller's training entry.
+The caller dispatches directly and assembles completed partitions in input order.
+
 All startup, tokenizer reconstruction, IPC, joining and list assembly happen inside
 BPE.encode(). No text or token files are created and no warm process pool is kept.
 """
@@ -16,6 +18,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 from bpe import BPE
 from parallel_bpe_encoding import THREAD_VARS, affinity
@@ -78,66 +81,135 @@ def _interruptible():
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
+class _Collector:
+    def __init__(self, count):
+        self.count, self.next = count, 0
+        self.pending, self.seen, self.ids = {}, set(), []
+
+    def accept(self, index, values):
+        if index in self.seen or not 0 <= index < self.count or not isinstance(values, array) or values.typecode != 'I':
+            raise RuntimeError('Duplicate, invalid or out-of-range partition')
+        self.seen.add(index)
+        self.pending[index] = values
+        while self.next in self.pending:
+            self.ids.extend(self.pending.pop(self.next))
+            self.next += 1
+
+    def finish(self):
+        if self.next != self.count:
+            raise RuntimeError('Incomplete BPE output')
+        return self.ids
+
+
+def _stop_processes(processes):
+    deadline = time.monotonic() + 5
+    for process in processes:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    for process in processes:
+        try:
+            process.wait(timeout=max(0., deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def _receive(receivers, processes):
+    ready = wait(receivers, timeout=.2)
+    if not ready and (any(p.poll() not in (None, 0) for p in processes)
+                      or not any(p.poll() is None for p in processes)):
+        raise RuntimeError('BPE workers exited before completing')
+    for connection in ready:
+        try:
+            message = connection.recv()
+        except EOFError as error:
+            raise RuntimeError('BPE worker closed its pipe before completing') from error
+        if message[0] == 'error':
+            raise RuntimeError(f'BPE worker {message[1]} failed: {message[2]}')
+        yield connection, message
+
+
 def _launch(tokenizer, text, ranges, cpus, workers):
     environment = os.environ.copy()
     environment.update({key: '1' for key in THREAD_VARS})
     environment['CUDA_VISIBLE_DEVICES'] = ''
     context = mp.get_context('spawn')
-    parent, child = context.Pipe(duplex=True)
-    process = None
+    connections, processes = [], []
+    collector = _Collector(len(ranges))
     with _interruptible():
         try:
-            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(child.fileno())],
-                                       pass_fds=(child.fileno(),), env=environment, start_new_session=True)
-            child.close()
-            # Snapshot the live tokenizer, including from_files()/constructor instances.
-            # Workers never reopen possibly changed or deleted serialization files.
-            parent.send((text, tokenizer.vocab, tokenizer.merges, tokenizer.special_tokens, ranges, cpus, workers))
-            ids, expected = [], 0
-            while True:
-                kind, index, payload = parent.recv()
-                if kind == 'error':
-                    raise RuntimeError(f'BPE coordinator failed: {payload}')
-                if kind == 'done':
-                    if index != len(ranges) or expected != len(ranges):
-                        raise RuntimeError('Incomplete BPE output')
-                    break
-                if kind != 'part' or index != expected or not isinstance(payload, array) or payload.typecode != 'I':
-                    raise RuntimeError('Invalid or unordered BPE output')
-                ids.extend(payload)
-                expected += 1
-            if process.wait() != 0:
-                raise RuntimeError('BPE coordinator exited unsuccessfully')
-            return ids
+            for index in range(workers):
+                parent, child = context.Pipe(duplex=True)
+                connections.extend([parent, child])
+                process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                                            str(child.fileno()), str(index)], pass_fds=(child.fileno(),),
+                                           env=environment, start_new_session=True)
+                processes.append(process)
+                child.close()
+                # Snapshot the live tokenizer once per worker; no files or full-text forwarding.
+                parent.send({'state': (tokenizer.vocab, tokenizer.merges, tokenizer.special_tokens),
+                             'cpu': cpus[index] if cpus else None})
+            peers = connections[::2]
+            starting = set(peers)
+            while starting:
+                for connection, (kind, index, payload) in _receive(list(starting), processes):
+                    if kind != 'ready' or connection not in starting:
+                        raise RuntimeError('Unexpected startup message')
+                    starting.remove(connection)
+            tasks, inflight = iter(enumerate(ranges)), {}
+
+            def dispatch(connection):
+                task = next(tasks, None)
+                if task is None:
+                    inflight[connection] = None
+                    connection.send(('stop', 0, None))
+                else:
+                    index, (lo, hi) = task
+                    inflight[connection] = index
+                    connection.send(('job', index, text[lo:hi]))
+
+            for connection in peers:
+                dispatch(connection)
+            active = list(peers)
+            while active:
+                for connection, (kind, index, payload) in _receive(active, processes):
+                    if kind == 'part' and inflight[connection] == index:
+                        collector.accept(index, payload)
+                        dispatch(connection)
+                    elif kind == 'done' and inflight[connection] is None:
+                        active.remove(connection)
+                    else:
+                        raise RuntimeError('Unexpected pipe-worker result')
+            for process in processes:
+                if process.wait() != 0:
+                    raise RuntimeError('BPE worker failed during exit')
+            return collector.finish()
         except EOFError as error:
-            raise RuntimeError('BPE coordinator closed before returning the complete encoding') from error
+            raise RuntimeError('BPE worker closed before returning complete output') from error
         finally:
-            parent.close()
-            child.close()
-            if process is not None:
-                # Also covers partial startup, a user interrupt and a failed result transfer.
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+            for connection in connections:
+                connection.close()
+            _stop_processes(processes)
 
 
-def _worker(index, cpu, state, jobs, output):
-    # Only the clean coordinator starts these workers; their entry imports no logging/model code.
+def _worker(index, request, output):
     try:
+        cpu = request['cpu']
         affinity([] if cpu is None else [cpu])
-        tokenizer = BPE(*state)
+        tokenizer = BPE(*request['state'])
         output.send(('ready', index, None))
         while True:
-            job = jobs.get()
-            if job is None:
+            kind, part, text = output.recv()
+            if kind == 'stop':
                 break
-            part, text = job
+            if kind != 'job':
+                raise RuntimeError('Unexpected worker command')
             packed = array('I', tokenizer._encode_serial(text))
             if packed.itemsize != 4:
                 raise RuntimeError('Requires 32-bit unsigned array storage')
@@ -153,87 +225,15 @@ def _worker(index, cpu, state, jobs, output):
         output.close()
 
 
-def _receive(receivers, processes):
-    ready = wait(receivers, timeout=.2)
-    if not ready and (any(p.exitcode not in (None, 0) for p in processes)
-                      or not any(p.is_alive() for p in processes)):
-        raise RuntimeError('BPE workers exited before completing')
-    for connection in ready:
-        try:
-            message = connection.recv()
-        except EOFError as error:
-            raise RuntimeError('BPE worker closed its pipe before completing') from error
-        if message[0] == 'error':
-            raise RuntimeError(f'BPE worker {message[1]} failed: {message[2]}')
-        yield connection, message
-
-
-def _coordinate(output, text, vocab, merges, specials, ranges, cpus, workers):
-    context = mp.get_context('spawn')
-    jobs = context.Queue()  # Unbounded dispatch avoids a jobs/results backpressure cycle.
-    processes, receivers, senders = [], [], []
-    parts = {}
-    try:
-        for index in range(workers):
-            receiver, sender = context.Pipe(duplex=False)
-            receivers.append(receiver)
-            senders.append(sender)
-            process = context.Process(target=_worker, args=(index, cpus[index] if cpus else None,
-                                                           (vocab, merges, specials), jobs, sender))
-            process.start()
-            processes.append(process)
-            sender.close()
-        ready = set()
-        while len(ready) < workers:
-            for _, (kind, index, payload) in _receive(receivers, processes):
-                if kind != 'ready' or index in ready:
-                    raise RuntimeError('Unexpected startup message')
-                ready.add(index)
-        for index, (start, end) in enumerate(ranges):
-            jobs.put((index, text[start:end]))
-        for _ in processes:
-            jobs.put(None)
-        active = list(receivers)
-        while active:
-            for connection, (kind, index, payload) in _receive(active, processes):
-                if kind == 'part' and 0 <= index < len(ranges) and index not in parts:
-                    parts[index] = payload
-                elif kind == 'done':
-                    active.remove(connection)
-                else:
-                    raise RuntimeError('Unexpected worker result')
-        for process in processes:
-            process.join()
-            if process.exitcode:
-                raise RuntimeError('BPE worker failed during exit')
-        if len(parts) != len(ranges):
-            raise RuntimeError('Missing BPE partitions')
-        for index in range(len(ranges)):
-            output.send(('part', index, parts.pop(index)))
-        output.send(('done', len(ranges), None))
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        for process in processes:
-            process.join()
-        for connection in receivers + senders:
-            connection.close()
-        jobs.cancel_join_thread()
-        jobs.close()
-
-
 def main():
-    # The coordinator is a fresh interpreter with thread limits/GPU hiding set before any import.
+    # A fresh interpreter receives its thread limits and GPU hiding before imports.
     def interrupted(signum, frame):
-        raise KeyboardInterrupt('BPE coordinator interrupted')
+        raise KeyboardInterrupt('BPE worker interrupted')
     signal.signal(signal.SIGTERM, interrupted)
     with Connection(int(sys.argv[1])) as output:
         try:
             request = output.recv()
-            cpus = request[-2]
-            affinity(cpus)
-            _coordinate(output, *request)
+            _worker(int(sys.argv[2]), request, output)
         except BaseException as error:
             try:
                 output.send(('error', 0, repr(error)))
