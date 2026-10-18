@@ -35,6 +35,16 @@ BEST_LR_REFERENCE_CASES = {
           'num_heads': 16, 'd_ff': 1344, 'min_learning_rate': 1e-3, 'warmup_steps': 6500,
           'optimizer_betas': (0.9, 0.95), 'weight_decay': .01, 'max_grad_norm': 1.0, 'seed': 1337},
 }
+PEAK_LR_SINGLE_CASES = {
+    'J': {'context_length': 512, 'batch_size': 64, 'learning_rate': 2e-3},
+}
+H_HISTORY = {
+    'case': 'H', 'run_id': '2cbae6a7f35e',
+    'wandb_url': 'https://wandb.ai/ziyang-zhang-east-china-normal-university/lmfs-assignment1/runs/2cbae6a7f35e',
+    'validation_context_length': 512, 'val_ppl': 36.14949117609303, 'val_loss': 3.5876628731555913,
+    'final_step': 54940, 'target_tokens': 1800273920, 'tokens_per_second': 86654.23665380906,
+    'total_seconds': 21173.86817636341,
+}
 REFERENCE_REVISION = 'c7bd4a373c1c56fc6cb02cc3f848c13d02a2b825'
 REFERENCE_ROOT = f'https://github.com/donglinkang2021/cs336-assignment1-basics/blob/{REFERENCE_REVISION}'
 REFERENCE_ADAPTATION = {
@@ -50,7 +60,7 @@ REFERENCE_ADAPTATION = {
                     'own BPE, initialization and sampling implementation; BF16',
                     'full native-context validation; no intermediate validation or best-checkpoint selection'],
 }
-ALL_CASES = {**CASES, **OPTIMIZER_BATCH_CASES, **BEST_LR_REFERENCE_CASES}
+ALL_CASES = {**CASES, **OPTIMIZER_BATCH_CASES, **BEST_LR_REFERENCE_CASES, **PEAK_LR_SINGLE_CASES}
 SUITES = {
     'context-lr': {'cases': CASES, 'gpus': [0, 1, 2, 3], 'cpu_offset': 0,
                    'disk_bytes': 100_000_000_000, 'output_name': 'context-lr-2x2'},
@@ -58,6 +68,8 @@ SUITES = {
                         'disk_bytes': 50_000_000_000, 'output_name': 'optimizer-batch-2gpu'},
     'best-lr-reference': {'cases': BEST_LR_REFERENCE_CASES, 'gpus': [1, 2, 3], 'cpu_offset': 16,
                           'disk_bytes': 75_000_000_000, 'output_name': 'best-lr-reference-3gpu'},
+    'peak-lr-single': {'cases': PEAK_LR_SINGLE_CASES, 'gpus': [1], 'cpu_offset': 0, 'required_cpus': 16,
+                       'disk_bytes': 25_000_000_000, 'output_name': 'peak-lr-2e3-single'},
 }
 
 
@@ -123,6 +135,8 @@ def case_config(base, case, cpu_ids, study_id, out):
     config.update(case_parameters(case))
     if case == 'I':
         config['reference_adaptation'] = REFERENCE_ADAPTATION
+    if case == 'J':
+        config['historical_reference'] = H_HISTORY
     config['tokens_per_step'] = config['batch_size'] * config['context_length']
     config['warmup_target_tokens'] = config['warmup_steps'] * config['tokens_per_step']
     config['cosine_target_tokens'] = config['cosine_steps'] * config['tokens_per_step']

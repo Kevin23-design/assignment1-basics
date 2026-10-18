@@ -94,7 +94,7 @@ def test_launcher_import_is_stdlib_only():
     assert result.returncode == 0
 
 
-@pytest.mark.parametrize('case', ['A', 'E', 'F', 'G', 'H', 'I'])
+@pytest.mark.parametrize('case', ['A', 'E', 'F', 'G', 'H', 'I', 'J'])
 def test_live_run_capture_and_entry_time(monkeypatch, tmp_path, case):
     root = tmp_path
     output = root / 'outputs' / case

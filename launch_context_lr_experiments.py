@@ -15,7 +15,7 @@ import sys
 import time
 
 from train_context_lr_experiment import (
-    REFERENCE_ADAPTATION, ROOT, SUITES, case_parameters, case_suite, eligible_result, save_result,
+    H_HISTORY, REFERENCE_ADAPTATION, ROOT, SUITES, case_parameters, case_suite, eligible_result, save_result,
 )
 
 SKIP = {'.git', '.venv', 'venv', 'outputs', 'wandb', 'data', 'datasets',
@@ -24,9 +24,10 @@ SKIP = {'.git', '.venv', 'venv', 'outputs', 'wandb', 'data', 'datasets',
 
 def allocate_cpus(allowed, suite='context-lr'):
     allowed = sorted(set(allowed))
-    if len(allowed) < 64:
-        raise ValueError(f'This CPU partition requires 64 allowed logical CPUs; found {len(allowed)}')
     settings = SUITES[suite]
+    required = settings.get('required_cpus', 64)
+    if len(allowed) < required:
+        raise ValueError(f'This CPU partition requires {required} allowed logical CPUs; found {len(allowed)}')
     offset = settings['cpu_offset']
     return {case: allowed[offset + index * 16:offset + (index + 1) * 16]
             for index, case in enumerate(settings['cases'])}
@@ -128,6 +129,17 @@ def collect(out, manifest, exit_codes, interrupted=False):
     if suite == 'best-lr-reference':
         aggregate['reference_adaptation'] = REFERENCE_ADAPTATION
         aggregate['comparison_groups'] = {'512': ['G', 'H'], '256': ['I']}
+    if suite == 'peak-lr-single':
+        aggregate['historical_reference'] = H_HISTORY
+        candidate = next(r for r in results if r['case'] == 'J')
+        valid = candidate['eligible']
+        ppl = candidate['summary']['val/ppl'] if valid else None
+        aggregate['historical_comparison'] = {
+            'eligible': valid,
+            'lower_ppl_than_H': ppl < H_HISTORY['val_ppl'] if valid else None,
+            'ppl_reduction_fraction': 1 - ppl / H_HISTORY['val_ppl'] if valid else None,
+            'interpretation': 'historical six-hour whole-run comparison; not a controlled equal-token comparison',
+        }
     save_result(out / 'results.json', aggregate)
     stop_fields = ['train_stop_reason', 'train_stop_elapsed_seconds', 'train_stop_remaining_seconds',
                    'train_stop_last_step_seconds', 'train_stop_step_safety_seconds', 'train_stop_reserve_seconds']
@@ -169,7 +181,8 @@ def collect(out, manifest, exit_codes, interrupted=False):
         writer.writerows(rows)
     titles = {'context-lr': '# 上下文 × 峰值学习率 2×2',
               'optimizer-batch': '# 优化器组合 × 大 batch 性能候选',
-              'best-lr-reference': '# 最佳配置复测、学习率对照与参考仓库六小时适配版'}
+              'best-lr-reference': '# 最佳配置复测、学习率对照与参考仓库六小时适配版',
+              'peak-lr-single': '# GPU 1：H 基线上的峰值学习率 2e-3 探索（J）'}
     title = titles[suite]
     history = ('历史 256 窗口参考：C（batch128、LR3e-4）PPL 45.18785；'
                'D（batch128、LR6e-4）PPL 41.75639。' if suite == 'optimizer-batch'
@@ -177,6 +190,10 @@ def collect(out, manifest, exit_codes, interrupted=False):
     if suite == 'best-lr-reference':
         history = ('历史 512 窗口最佳 B：PPL 40.18098；256 窗口 C/D/E/F：'
                    '45.18785 / 41.75639 / 47.00493 / 43.51419。')
+    if suite == 'peak-lr-single':
+        history = (f"历史 H：[W&B]({H_HISTORY['wandb_url']})，512 窗口 PPL {H_HISTORY['val_ppl']:.5f}，"
+                   f"最终 {H_HISTORY['final_step']:,} 步，{H_HISTORY['target_tokens']:,} 个训练目标 token，"
+                   f"吞吐 {H_HISTORY['tokens_per_second']:.2f} token/s，总耗时 {H_HISTORY['total_seconds']:.2f} 秒。")
     lines = [title,
              '各组使用自身上下文完成验证；跨上下文比较评价整套配置，不单独归因于训练上下文。',
              history,
@@ -226,6 +243,21 @@ def collect(out, manifest, exit_codes, interrupted=False):
                   '保留本人 BPE、BF16、现有初始化与采样、完整验证，不增加中间验证。',
                   '三组不因达到 65K 停训；终点后保持各自最低 LR。',
                   '同 token 附近的训练区间 loss 为辅助证据；单次实验不声称统计显著。']
+    elif suite == 'peak-lr-single':
+        comparison = aggregate['historical_comparison']
+        if not comparison['eligible']:
+            conclusion = 'J 尚无有效完整结果，不比较速度或验证 PPL 优势。'
+        elif comparison['lower_ppl_than_H']:
+            conclusion = (f"J 比历史 H 的验证 PPL 降低 {comparison['ppl_reduction_fraction']:.2%}，"
+                          '列为新候选，未自动接入 dev。')
+        else:
+            conclusion = 'J 未取得低于历史 H 的验证 PPL，保留 H 为参考。'
+        lines += ['', conclusion,
+                  'J/H 训练超参仅峰值 LR 从 1e-3 改为 2e-3；最低 LR3e-5、warmup500、余弦终点65K不变。',
+                  '65K 后保持最低 LR，继续按六小时预算训练，不固定为 H 的 54,940 步。',
+                  '只保存最后模型，完整验证 66,401,097 个目标，不增加中间验证或挑选最佳检查点。',
+                  '单卡负载可能改变吞吐和训练 token 总量；历史比较评价整套六小时运行，不能全部归因于 LR。',
+                  '相近累计 token 的区间训练 loss 仅为辅助证据，单次结果不声称统计显著。']
     else:
         lines += ['', 'B/A、D/C 比较同上下文的学习率；C/A、D/B 比较固定 token batch 的上下文安排。']
     lines += ['', '每步目标 token：' + '，'.join(f"{r['case']}={r['tokens_per_step']:,}" for r in rows) + '。',
@@ -273,6 +305,8 @@ def launch(args):
                     for case, gpu in zip(cases, args.gpus, strict=True)}}
     if args.suite == 'best-lr-reference':
         manifest['reference_adaptation'] = REFERENCE_ADAPTATION
+    if args.suite == 'peak-lr-single':
+        manifest['historical_reference'] = H_HISTORY
     save_result(out / 'manifest.json', manifest)
     processes, logs, codes = {}, {}, {}
     interrupted = False

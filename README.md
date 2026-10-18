@@ -748,3 +748,66 @@ python -m pytest tests/test_best_lr_reference_suite.py tests/test_context_lr_exp
   tests/test_optimizer_batch_suite.py tests/test_training.py tests/test_optimizer.py \
   tests/test_tokenizer.py tests/test_train_bpe.py tests/test_parallel_bpe_experiment.py -q
 ```
+
+## GPU 1 单组 J：峰值学习率 2e-3
+
+`exploration` 新增固定 `peak-lr-single` suite，只包含 J，旧 A–I 和 `dev` 不变。
+历史 H（run `2cbae6a7f35e`）的 512 窗口完整验证 PPL 为 **36.14949**，相对 G 的
+38.10523 降低约 5.13%；两组训练目标 token 数仅差约 0.49%。本轮只将 H 的峰值 LR
+从 **1e-3 提高至 2e-3**，评估更高 LR 能否继续改善六小时内的最后模型。
+
+| 参数 | 固定 J 配置 |
+|---|---|
+| GPU / 内部 device | 1 / cuda:0 |
+| 模型 | 4 层、512 维、8 头、FFN 1408、RoPE θ=10,000 |
+| 训练与验证 context / batch | 512 / 64，每步 32,768 目标 token |
+| 峰值 / 最低 LR | 2e-3 / 3e-5 |
+| warmup / 余弦终点 step | 500 / 65,000 |
+| AdamW β / ε / weight decay | (0.9, 0.999) / 1e-8 / 0.1 |
+| 梯度裁剪 / 精度 / seed | 1.0 / BF16 / 42 |
+| eval batch / 完整验证目标数 | 16 / 66,401,097，尾部计分 |
+| 总预算 / 收尾预留 | 21,600 / 600 秒 |
+
+65K 后保持最低 LR，继续按六小时预算训练，不固定为历史 H 的 54,940 步。
+只保存最后模型，不做中间验证或选择最佳检查点。重新使用现有
+`outputs/e9275a3b4a7a/tokenizer` 编码完整公共 train/valid 原文，从随机权重开始；
+不续训 H，不复用历史 token 文件或模型检查点。
+
+云端运行（预先配置个人 W&B 环境变量）：
+
+```bash
+source /env/activate_a1.sh
+
+python launch_context_lr_experiments.py \
+  --suite peak-lr-single \
+  --gpus 1 \
+  --output-dir outputs/peak-lr-2e3-single
+```
+
+默认 GPU 为 1。使用当前允许 CPU 排序后的前 **16** 个，父进程及 worker 均受 affinity
+硬限制；不足 16 核直接失败。新 suite 不要求 64 核，旧 suite 的 64 核分区要求不变。
+编码继续使用 16 workers、每 worker 1M 清空缓存、内部线程 1、GPU 隐藏；全部退出后
+才初始化模型。输出目录必须不存在，磁盘预检至少 **25 GB**。公共数据只读，不修改
+共享依赖，不做额外 GPU 试训，不自动降低 batch 或换参数重跑。
+
+只创建一个 `transformer-peak-lr-single-exploration` W&B run，课程记录器保留完整源码，
+入口导入、记录、编码、训练、保存和完整验证全部计时。沿用低频有限性检查、截止检查、
+停训诊断和异常清理；OOM、非有限 loss、超时或验证失败记为失败。
+
+W&B 配置、manifest 和汇总 JSON 保留历史 H 的 run 链接与指标。本地 JSON/CSV/Markdown
+记录 J 的最终 loss/PPL、step、累计训练目标 token、训练 token/s、峰值显存、阶段与总
+耗时、停训原因。仅完整验证成功、源码未变、累计不超过六小时的结果进入有效比较。
+报告检查 J 的完整验证 PPL 是否低于 H 的精确值 36.14949117609303；无效结果不宣称优势。
+
+历史 H 为 1,800,273,920 训练目标 token、86,654.24 token/s、总耗时 21,173.87 秒。
+单卡负载可能改变吞吐和训练量，历史 H/J 比较评价整套六小时运行结果，不能将全部差异
+归因于 LR；相近累计 token 的区间训练 loss 仅为辅助证据。即使更好也只列为新候选，
+不自动更新 dev，不把单次结果当作统计显著结论。
+
+本地仅小规模测试：
+
+```bash
+python -m pytest tests/test_peak_lr_single_suite.py tests/test_context_lr_experiments.py \
+  tests/test_best_lr_reference_suite.py tests/test_optimizer_batch_suite.py tests/test_training.py \
+  tests/test_optimizer.py tests/test_tokenizer.py tests/test_train_bpe.py tests/test_parallel_bpe_experiment.py -q
+```
