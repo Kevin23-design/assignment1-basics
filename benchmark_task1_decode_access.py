@@ -15,6 +15,7 @@ import sys
 import benchmark_task1_assembly as assembly
 from task1_assembly_runtime import verify_build as verify_assembly
 from task1_decode_access_experiment import CASES, PARTS, make_snapshot
+from task1_benchmark_reporting import table_rows
 from task1_decode_access_runtime import verify_build as verify_access
 from task1_decode_experiment import integration_decision, verify_snapshot
 from task1_native_adapter_experiment import assert_identical_native
@@ -173,7 +174,7 @@ def publish(run, out, rows, selection):
     columns = ['trial_id', 'stage', 'method', 'parts', 'diagnostic', 'status', 'total_seconds', 'encode_seconds',
                'decode_seconds', 'compare_seconds', 'token_count', 'ids_match_reference', 'roundtrip_passed',
                'cpu_affinity', 'parent_peak_rss_bytes', 'native_decode', 'system_load_before', 'system_load_after']
-    run.log({'decode_access/trials': wandb.Table(columns=columns, data=[[r.get(k) for k in columns] for r in rows])})
+    run.log({'decode_access/trials': wandb.Table(columns=columns, data=table_rows(columns, rows))})
     run.summary.update({'completed': True, 'training': False, 'recommended': selection['recommended'],
                         'integration_passed': selection['integration']['passed'], 'submission_provenance_verified': False})
     manifest = json.loads((out / 'manifest.json').read_text())

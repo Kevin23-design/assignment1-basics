@@ -129,7 +129,8 @@ def execute(job, result_path):
                     raise ValueError('Ordinary candidate bypassed its normal assembly backend')
                 result['assembly'] = assembly
                 if assembly['method'] != 'M0':
-                    expected = Path(snapshot['directory']) / snapshot['assembly_build']['binary']
+                    build = snapshot.get('parent_assembly_build', snapshot['assembly_build'])
+                    expected = Path(snapshot['directory']) / build['binary']
                     if Path(assembly['extension_path']).resolve() != expected.resolve():
                         raise ValueError('Assembly extension loaded from another snapshot')
                 build = snapshot.get('decode_access_build', snapshot['native_build'])
@@ -145,6 +146,13 @@ def execute(job, result_path):
             if snapshot.get('decode_access_build'):
                 from task1_decode_access_runtime import check_result
                 check_result(snapshot, {'native_decode': result['native_decode'], 'token_count': len(ids)})
+            if snapshot.get('parent_pipeline_case'):
+                if snapshot.get('parent_pipeline_diagnostic'):
+                    raise ValueError('Cannot confirm diagnostic parent pipeline')
+                result['parent_pipeline_case'] = snapshot['parent_pipeline_case']
+            if snapshot.get('parent_assembly_build'):
+                from task1_parent_pipeline_runtime import check_result
+                check_result(snapshot, {'assembly': result['assembly'], 'token_count': len(ids)})
             compare_reference(ids, job['reference'])
             check_sources(snapshot)
             check_inputs(job)

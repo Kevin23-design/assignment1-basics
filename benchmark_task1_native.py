@@ -114,7 +114,8 @@ def worker(job, result_path):
                 raise ValueError('Candidate bypassed its assembly backend')
             result['assembly'] = assembly
             if assembly['method'] != 'M0':
-                expected = Path(job['snapshot']['directory']) / job['snapshot']['assembly_build']['binary']
+                build = job['snapshot'].get('parent_assembly_build', job['snapshot']['assembly_build'])
+                expected = Path(job['snapshot']['directory']) / build['binary']
                 if Path(assembly['extension_path']).resolve() != expected.resolve():
                     raise ValueError('Assembly extension loaded from another snapshot')
             if not job['diagnostic']:
@@ -125,6 +126,9 @@ def worker(job, result_path):
         if job['snapshot'].get('decode_access_build'):
             from task1_decode_access_runtime import check_result
             check_result(job['snapshot'], {'native_decode': native_metrics, 'token_count': len(ids)})
+        if job['snapshot'].get('parent_assembly_build'):
+            from task1_parent_pipeline_runtime import check_result
+            check_result(job['snapshot'], {'assembly': result['assembly'], 'token_count': len(ids)})
         common.check_reference(ids, job['reference'])
         verify_snapshot(job['snapshot'])
         result.update(status='ok', total_seconds=ended - began, encode_seconds=encoded - began,

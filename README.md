@@ -1346,3 +1346,63 @@ N2 的诊断检查/累计时间包含索引写入，复制时间包含首次触�
 普通接口中位数须不超过实验路径的 103%，至少 4/5 对不超过对应实验路径的 105%。
 活跃确认比普通接口中位数慢超过 5% 时保留回退标记，不直接归因于 W&B。
 本地只编译与验证小文本；完整验证实验在云端执行，不修改默认 BPE 或课程入口。
+
+### 任务一：父进程调度与最终列表组装探索
+
+第 5 轮保留 **N2 + 256 分片**：N0/N2 配对中位数 7.183/6.120 秒，降低 14.79%，5/5 胜出。
+N2 对 N1 的额外收益为 3.35%，4/5 胜出，代价是约 253 MiB 的调用内索引。
+128 分片复测未过门槛（6.012/6.054 秒，仅胜出2/5），不推广。
+普通接口中位数 6.003 秒，活跃 W&B 确认 6.080 秒（+1.28%）；历史上下文回退标记不改写。
+活跃确认中 encode/decode/比较分别约4.019/1.875/0.187秒，因此下一轮先探索父进程编码流水。
+
+上轮探索的计算及正确性有效，但 W&B Table 上传失败：N0/N1/N2 诊断行的字典字段不同，触发列类型冲突。
+现已将动态字典和数组列统一序列化为 JSON 文本，保留稳定标量列；逐次 JSON 仍为完整结构。
+修复同时用于旧解码访问入口及新入口；不修改历史报告，也不将历史上传失败改为成功。
+
+| 候选 | 相对本轮 N2/256 的变化 |
+|---|---|
+| Q0 | 已通过普通接口验收的本轮路径 |
+| Q1 | 收到结果后先派发下一任务，再组装当前结果 |
+| Q2 | Q1 + Cython 直接将池中整数追加到最终 list，取消分片临时 list |
+| Q3 | Q1 + 保留实际返回数组，收齐并退出 worker 后按真实长度一次分配完整 list |
+
+四组固定16 workers、256安全分片、每worker 1M清空缓存；原编码、整数池及N2解码二进制保留。
+Q2/Q3使用独立扩展；Q3仅依据实际收到的数组长度分配，禁止使用参考token数量预分配。
+Q3包含暂存原始uint32数组的内存成本，并可能损失原有流水重叠，不预设胜出。
+默认四组各5次交错筛选，最快新组再与Q0做5对复测，要求中位数至少降低3%、至少赢4/5对。
+若Q2/Q3推广，再与Q1做5对机制对照；该对照不改变主要推广结论。
+随后独立确认和5对普通接口接入，活跃W&B确认单独运行。
+全部计时仍是公开encode→完整list[int]→公开decode→原文比较，所有退出、暂存、最终组装及清理均计入。
+诊断单独记录finish_assembly_seconds，避免漏计Q3收尾组装；跨进程重叠阶段不相加。
+每次精确对照完整66,401,098个ID并还原全文；错误停止，候选串行，CPU硬限制继承同一16核。
+
+使用固定个人解释器，无需新增依赖或重训，仅编译新的父进程组装扩展：
+
+```bash
+bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
+
+"$bpe_python" build_task1_parent_assembly.py \
+  --output-dir outputs/task1-parent-assembly-build
+
+"$bpe_python" benchmark_task1_parent_pipeline.py \
+  --previous-selection outputs/task1-decode-access/selection.json \
+  --plain-confirmation outputs/task1-decode-access-plain-confirmation/confirmation.json \
+  --build-dir outputs/task1-parent-assembly-build \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-parent-pipeline
+```
+
+接入验收通过后：
+
+```bash
+"$bpe_python" benchmark_task1_parent_pipeline.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-parent-pipeline/selection.json \
+  --output-dir outputs/task1-parent-pipeline-plain-confirmation
+```
+
+保留前阶段正常N2快照、原构建及参考文件，新输出目录须不存在。
+源码、三个原扩展、新扩展及输入均做指纹核验，记录Python ABI、编译器及实际加载路径。
+接入中位数不超过实验路径103%，至少4/5对不超过对应实验路径105%；活跃确认超出接入中位数5%仍保留标记。
+仅在exploration探索，不自动更新dev、默认BPE或课程入口；不承诺低于5秒。
