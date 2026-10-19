@@ -1216,3 +1216,85 @@ bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
 
 测试会在临时目录构建小文本所需的本机扩展以模拟前阶段快照；云端探索入口本身
 只复用既有扩展，不运行编译器。
+
+### 任务一：列表组装与整数池复用探索
+
+`benchmark_task1_assembly.py` 从上一轮通过验收的正常 A0/CY-D、A1/CY-ED 快照派生候选。
+先固定 CY-D 比较父进程列表组装；胜出后再与修复后的 A1 编码组合。`dev`、默认 BPE、
+课程入口和原生解码二进制不变，不重新训练词表，也不扫描分片数。
+
+| 方法 | 父进程组装 |
+|---|---|
+| M0 | 原 `list.extend(array('I'))` |
+| M1 | Cython 正常创建/取得 Python 整数，构造分片列表再追加 |
+| M2 | 与 M1 相同，但从本次 encode 创建的整数池复用整数对象 |
+
+M1/M2 使用相同的临时列表与最终列表增长方式。输入是实际 worker 返回的连续 uint32
+buffer；检查格式、4 字节大小、对齐、ID 范围及长度溢出。整数池按词表建立，不使用
+参考 token 数预分配结果。对新列表采用正确的引用转移，最终返回真实完整 `list[int]`；
+池释放后列表仍独立有效。原生解码照常根据传入 ID 和词表还原文本，不读取原文缓存。
+
+新增的是独立组装扩展；已有 Cython/编译器即可，不需要增加依赖。仍须使用固定解释器：
+
+```bash
+bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
+
+"$bpe_python" build_task1_assembly.py \
+  --output-dir outputs/task1-assembly-build
+
+"$bpe_python" benchmark_task1_assembly.py \
+  --previous-selection outputs/task1-native-adapter/selection.json \
+  --plain-confirmation outputs/task1-native-adapter-plain-confirmation/confirmation.json \
+  --build-dir outputs/task1-assembly-build \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-assembly
+```
+
+构建和实验输出目录须不存在；上轮正常 A0/A1 快照、原构建产物、词表、原文及参考文件
+必须保留。预检拒绝诊断快照和 ABI/指纹不匹配，复制原解码扩展时保持其字节完全不变。
+只显式构建新扩展，测速期间不自动编译、不静默回退。修改组装 `.pyx` 后需显式重新构建。
+
+资源固定为相同 16 个逻辑 CPU、16 workers、256 安全分片、每 worker 1M 清空缓存；
+内部线程为 1，GPU 隐藏。计时覆盖公开 encode、完整 list、decode 和原文比较，包括
+新扩展首次导入、整数池准备、临时列表和引用处理、进程启动、传输、退出及清理。
+文件读取/词表加载和完整参考核对在计时外；每次须匹配 66,401,098 个 ID 并全文还原。
+
+流程：
+
+1. M0/M1/M2 各五次固定种子交错测速；若 M0 最快则保留它，否则最快新方案与 M0
+   做五对独立随机顺序复测。完整中位数降低至少 3% 且胜出至少 4/5 对才推广。
+2. 若推广 M2，再做 M2/M1 五对机制比较，判断整数池的独立收益；这一结果只作解释，
+   不改变已经通过主对照的方案。
+3. 若推广 M1/M2，固定其组装方式，对 CY-D 与修复后的 A1 编码各做五次交错测速、
+   五对独立复测；用相同门槛判断是否组合。未推广组装则跳过组合阶段。
+4. 最终方案独立确认一次，再做五对普通接口验收：中位数≤实验路径103%，且至少
+   4/5对≤对应实验路径105%。只保存最终推荐，不挑选最快单次作为成绩。
+
+`--diagnostics` 对三组使用单独快照，解码改用辅助扩展中的诊断副本，复现原解码算法并
+分别计时词表准备、ID检查/长度累计、bytes分配、复制及首次触页、UTF-8解码与清理。
+诊断副本不参与排名，不改变正常解码；不额外清零输出缓冲区，也不把 allocation 时间
+解释为已支付全部首次写入成本。组合阶段另做一轮组合诊断。诊断、重叠阶段及worker
+峰值RSS之和不能相加当作完整耗时或实际同时峰值。记录父进程峰值、worker内存、任务
+分布、每次试验前后UTC及整机load average。
+
+普通接口验收通过后：
+
+```bash
+"$bpe_python" benchmark_task1_assembly.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-assembly/selection.json \
+  --output-dir outputs/task1-assembly-plain-confirmation
+```
+
+探索为一个 `bpe-task1-assembly-exploration` W&B run，活跃确认另建一个
+`bpe-task1-plain-confirmation` run；活跃确认超过接入中位数5%时标记回退。W&B和本地
+JSON/CSV/Markdown保留全部候选源码、`.pyx`、生成C、新旧二进制、ABI、编译器、编译参数
+及SHA-256；普通确认记录 `assembly_case` 和实际加载路径。上传失败与计算失败分开记录，
+运行前后及上传结束后核对指纹。不自动更新 `dev`，不预先承诺低于5秒。
+
+本地只做小文本回归（测试会在临时目录编译本机扩展，云端实验入口本身不编译）：
+
+```bash
+.venv/bin/python -m pytest -q tests/test_task1_assembly.py
+```

@@ -121,6 +121,20 @@ def execute(job, result_path):
                         w['native_encoding']['fallback_calls'] or not w['native_encoding']['native_calls']
                         for w in worker_metrics):
                     raise ValueError('Candidate silently bypassed native encoding')
+            if snapshot.get('assembly_build'):
+                assembly = getattr(tokenizer, '_task1_assembly_metrics', None)
+                if (snapshot.get('assembly_diagnostic') or not assembly
+                        or assembly.get('method') != snapshot['assembly_method']
+                        or assembly.get('converted_ids') != len(ids)):
+                    raise ValueError('Ordinary candidate bypassed its normal assembly backend')
+                result['assembly'] = assembly
+                if assembly['method'] != 'M0':
+                    expected = Path(snapshot['directory']) / snapshot['assembly_build']['binary']
+                    if Path(assembly['extension_path']).resolve() != expected.resolve():
+                        raise ValueError('Assembly extension loaded from another snapshot')
+                expected = Path(snapshot['directory']) / snapshot['native_build']['binary']
+                if Path(result['native_decode']['extension_path']).resolve() != expected.resolve():
+                    raise ValueError('Ordinary candidate replaced the native decoder')
             compare_reference(ids, job['reference'])
             check_sources(snapshot)
             check_inputs(job)

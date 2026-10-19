@@ -98,6 +98,20 @@ def worker(job, result_path):
         if job['method'] == 'CY-ED' and any(not w.get('native_encoding') or
                 w['native_encoding']['fallback_calls'] or not w['native_encoding']['native_calls'] for w in metadata):
             raise ValueError('Candidate silently bypassed native encoding')
+        if job['snapshot'].get('assembly_build'):
+            assembly = getattr(tokenizer, '_task1_assembly_metrics', None)
+            if (not assembly or assembly.get('method') != job['snapshot']['assembly_method']
+                    or assembly.get('converted_ids') != len(ids)):
+                raise ValueError('Candidate bypassed its assembly backend')
+            result['assembly'] = assembly
+            if assembly['method'] != 'M0':
+                expected = Path(job['snapshot']['directory']) / job['snapshot']['assembly_build']['binary']
+                if Path(assembly['extension_path']).resolve() != expected.resolve():
+                    raise ValueError('Assembly extension loaded from another snapshot')
+            if not job['diagnostic']:
+                expected = Path(job['snapshot']['directory']) / job['snapshot']['native_build']['binary']
+                if Path(native_metrics['extension_path']).resolve() != expected.resolve():
+                    raise ValueError('Normal trial replaced the original native decoder')
         common.check_reference(ids, job['reference'])
         verify_snapshot(job['snapshot'])
         result.update(status='ok', total_seconds=ended - began, encode_seconds=encoded - began,
