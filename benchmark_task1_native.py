@@ -71,11 +71,18 @@ def worker(job, result_path):
     previous.validate_tokenizer(tokenizer)
     with open(job['valid_file'], encoding='utf-8', newline='') as handle:
         text = handle.read()
+    if 'preflight_parts' in job:
+        from bpe_memory_runtime import _partition_ranges
+        availability = {str(parts): _partition_ranges(tokenizer, text, parts) is not None
+                        for parts in job['preflight_parts']}
+        common.save_json(result_path, {'availability': availability})
+        return
     if tokenizer._cache:
         raise RuntimeError('Expected an empty cache')
     result = {'status': 'failed', 'method': job['method'], 'diagnostic': job['diagnostic'],
               'patching': bool(job['diagnostic']), 'timing_scope': 'full-public-interface',
-              'cpu_affinity': job['cpus'], 'encode_workers': job['workers'], 'parts': job['workers'] * 16,
+              'cpu_affinity': job['cpus'], 'encode_workers': job['workers'],
+              'parts': job['snapshot'].get('parts', job['workers'] * 16),
               'cache_capacity': 1048576, 'bpe_source': str(Path(bpe.__file__).resolve())}
     stats = {}
     try:
@@ -92,6 +99,8 @@ def worker(job, result_path):
         metadata = getattr(tokenizer, '_task1_worker_metrics', [])
         if not metadata:
             raise ValueError('Encoder bypassed the required direct-worker path')
+        if job['snapshot'].get('decode_access_case') and sum(w['tasks'] for w in metadata) != result['parts']:
+            raise ValueError('Encoder used a different number of partitions')
         native_metrics = getattr(tokenizer, '_native_decode_metrics', None)
         if job['method'] != 'B0' and (not native_metrics or native_metrics.get('backend') != 'native'):
             raise ValueError('Candidate silently bypassed native decoding')
@@ -109,9 +118,13 @@ def worker(job, result_path):
                 if Path(assembly['extension_path']).resolve() != expected.resolve():
                     raise ValueError('Assembly extension loaded from another snapshot')
             if not job['diagnostic']:
-                expected = Path(job['snapshot']['directory']) / job['snapshot']['native_build']['binary']
+                build = job['snapshot'].get('decode_access_build', job['snapshot']['native_build'])
+                expected = Path(job['snapshot']['directory']) / build['binary']
                 if Path(native_metrics['extension_path']).resolve() != expected.resolve():
                     raise ValueError('Normal trial replaced the original native decoder')
+        if job['snapshot'].get('decode_access_build'):
+            from task1_decode_access_runtime import check_result
+            check_result(job['snapshot'], {'native_decode': native_metrics, 'token_count': len(ids)})
         common.check_reference(ids, job['reference'])
         verify_snapshot(job['snapshot'])
         result.update(status='ok', total_seconds=ended - began, encode_seconds=encoded - began,

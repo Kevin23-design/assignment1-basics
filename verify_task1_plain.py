@@ -132,9 +132,19 @@ def execute(job, result_path):
                     expected = Path(snapshot['directory']) / snapshot['assembly_build']['binary']
                     if Path(assembly['extension_path']).resolve() != expected.resolve():
                         raise ValueError('Assembly extension loaded from another snapshot')
-                expected = Path(snapshot['directory']) / snapshot['native_build']['binary']
+                build = snapshot.get('decode_access_build', snapshot['native_build'])
+                expected = Path(snapshot['directory']) / build['binary']
                 if Path(result['native_decode']['extension_path']).resolve() != expected.resolve():
                     raise ValueError('Ordinary candidate replaced the native decoder')
+            if snapshot.get('decode_access_case'):
+                if snapshot.get('decode_access_diagnostic'):
+                    raise ValueError('Cannot confirm a diagnostic decoder')
+                if sum(w['tasks'] for w in result['worker_metadata']) != snapshot['parts']:
+                    raise ValueError('Ordinary encoder used different partition count')
+                result.update(parts=snapshot['parts'], decode_access_case=snapshot['decode_access_case'])
+            if snapshot.get('decode_access_build'):
+                from task1_decode_access_runtime import check_result
+                check_result(snapshot, {'native_decode': result['native_decode'], 'token_count': len(ids)})
             compare_reference(ids, job['reference'])
             check_sources(snapshot)
             check_inputs(job)

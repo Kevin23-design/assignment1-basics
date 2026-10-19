@@ -1298,3 +1298,51 @@ JSON/CSV/Markdown保留全部候选源码、`.pyx`、生成C、新旧二进制�
 ```bash
 .venv/bin/python -m pytest -q tests/test_task1_assembly.py
 ```
+
+### 任务一：解码对象访问与分片数探索（不更新 dev）
+
+下一轮从已通过普通接口接入的正常 **M2-A1** 快照派生，复用原词表和参考 ID，不训练。
+第一阶段固定 256 分片，比较 N0（原原生解码）、N1（持有 GIL、借用列表元素引用）、N2（N1 加调用内 uint32 索引）。
+N2 的索引按实际输入列表长度分配，完整验证约额外 253 MiB；准备和释放均计时，不使用 encode 留下的数组。
+第二阶段固定胜出的解码，比较 64/128/256/512 个安全分片；仍为 16 workers、每 worker 1M 清空缓存及整数池组装。
+
+每组五次交错筛选，最快新方案与阶段基线再做五对复测：完整耗时中位数至少降低 3%，且至少胜出 4/5 对才推广。
+N2 被推广时另做 N1/N2 五对机制对照。随后独立确认、五对普通接口接入验收；活跃 W&B 确认单独执行。
+全部排名计时为公开 encode → 完整 list[int] → 公开 decode → 原文比较，首次扩展导入、进程退出及缓冲清理均计入。
+每次核对完整 66,401,098 个参考 ID 并还原全文；诊断不进入排名。不足以生成要求数量非空安全分片的配置明确排除，不静默串行回退。
+
+只支持带 GIL 的 CPython 3.13，使用已有个人环境，无新增依赖。原编码、整数池扩展不重编译；仅显式编译独立解码扩展：
+
+```bash
+bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
+
+"$bpe_python" build_task1_decode_access.py \
+  --output-dir outputs/task1-decode-access-build
+
+"$bpe_python" benchmark_task1_decode_access.py \
+  --previous-selection outputs/task1-assembly/selection.json \
+  --plain-confirmation outputs/task1-assembly-plain-confirmation/confirmation.json \
+  --build-dir outputs/task1-decode-access-build \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-decode-access
+```
+
+保留上轮原始快照和构建产物；新输出目录须不存在。预检核对源码、ABI、二进制及全部输入指纹，并继承相同 16 核硬限制，GPU 隐藏、内部线程为 1。
+只读分片预检使用单独解释器；正常计时仍重新计算分片，不复用预检结果或编码缓存。
+结果包含阶段选择、分片数、RSS、诊断分项、系统负载和历史上下文回退标记。
+N2 的诊断检查/累计时间包含索引写入，复制时间包含首次触页；不将重叠阶段相加。
+上传失败与计算有效性分别记录，不将单次探索结果作为课程正式成绩。
+
+接入门槛通过后，以同一解释器执行活跃 W&B 独立确认：
+
+```bash
+"$bpe_python" benchmark_task1_decode_access.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-decode-access/selection.json \
+  --output-dir outputs/task1-decode-access-plain-confirmation
+```
+
+普通接口中位数须不超过实验路径的 103%，至少 4/5 对不超过对应实验路径的 105%。
+活跃确认比普通接口中位数慢超过 5% 时保留回退标记，不直接归因于 W&B。
+本地只编译与验证小文本；完整验证实验在云端执行，不修改默认 BPE 或课程入口。
