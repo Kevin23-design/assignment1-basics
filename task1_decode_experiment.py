@@ -44,7 +44,7 @@ def replace_function(source, name, replacement, class_name=None):
 def source_hashes(directory):
     directory = Path(directory)
     return {path.relative_to(directory).as_posix(): common.sha256(path)
-            for path in sorted(directory.iterdir()) if path.is_file() and path.suffix in ('.py', '.json')
+            for path in sorted(directory.iterdir()) if path.is_file() and path.suffix in ('.py', '.json', '.pyx', '.pxd', '.c', '.h', '.so', '.pyd')
             and path.name != 'snapshot.json'}
 
 

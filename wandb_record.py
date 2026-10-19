@@ -11,7 +11,7 @@ def experiment(task, config, root="."):
     root = Path(root).resolve()
     skipped = {".git", ".venv", "venv", "outputs", "wandb", "data",
                "datasets", "checkpoints", "__pycache__", ".pytest_cache"}
-    suffixes = {".py", ".sh", ".ipynb", ".cu", ".c", ".cpp", ".h", ".rs"}
+    suffixes = {".py", ".sh", ".ipynb", ".cu", ".c", ".cpp", ".h", ".rs", ".pyx", ".pxd", ".so", ".pyd"}
     sources = []
     for directory, dirs, names in os.walk(root):
         dirs[:] = sorted(d for d in dirs if d not in skipped)
@@ -43,6 +43,11 @@ def experiment(task, config, root="."):
             frozen.parent.mkdir(parents=True, exist_ok=True)
             frozen.write_bytes(content)
             artifact.add_file(str(frozen), name=rel)
+            if path.suffix in {".so", ".pyd"}:
+                block = f"===== BINARY {rel} SHA256={digest} SIZE={len(content)} =====\n"
+                print(block, flush=True)
+                dump.append(block)
+                continue
             lines = "\n".join(f"{i:05d} | {line}" for i, line in
                               enumerate(content.decode("utf-8-sig").splitlines(), 1))
             block = f"===== SOURCE {rel} SHA256={digest} =====\n{lines}\n"

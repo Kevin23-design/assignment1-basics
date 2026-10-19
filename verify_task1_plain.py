@@ -27,7 +27,7 @@ def check_sources(snapshot):
     if json.loads((root / 'snapshot.json').read_text()) != snapshot:
         raise ValueError('Plain candidate snapshot metadata changed')
     actual = {p.name: sha(p) for p in root.iterdir()
-              if p.is_file() and p.suffix in ('.py', '.json') and p.name != 'snapshot.json'}
+              if p.is_file() and p.suffix in ('.py', '.json', '.pyx', '.pxd', '.c', '.h', '.so', '.pyd') and p.name != 'snapshot.json'}
     if actual != snapshot['source_sha256']:
         raise ValueError('Plain candidate source changed')
 
@@ -107,6 +107,20 @@ def execute(job, result_path):
             ended = time.perf_counter()
             if not isinstance(ids, list) or len(ids) != job['expected_tokens'] or not passed:
                 raise ValueError('Plain BPE failed token count or exact roundtrip')
+            if snapshot.get('native_build'):
+                metrics = getattr(tokenizer, '_native_decode_metrics', None)
+                result['native_decode'] = metrics
+                if snapshot['method'] != 'B0' and (not metrics or metrics.get('backend') != 'native'):
+                    raise ValueError('Formal candidate silently bypassed native decoding')
+                result['native_extension_loaded_during'] = 'task1_native_runtime' not in before
+                worker_metrics = getattr(tokenizer, '_task1_worker_metrics', [])
+                result['worker_metadata'] = worker_metrics
+                if not worker_metrics:
+                    raise ValueError('Native-suite candidate bypassed direct workers')
+                if snapshot['method'] == 'CY-ED' and any(not w.get('native_encoding') or
+                        w['native_encoding']['fallback_calls'] or not w['native_encoding']['native_calls']
+                        for w in worker_metrics):
+                    raise ValueError('Candidate silently bypassed native encoding')
             compare_reference(ids, job['reference'])
             check_sources(snapshot)
             check_inputs(job)

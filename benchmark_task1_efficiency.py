@@ -53,7 +53,7 @@ def source_fingerprints():
         directories[:] = sorted(d for d in directories if d not in SKIP)
         for name in sorted(names):
             path = Path(folder) / name
-            if path.suffix in {'.py', '.sh', '.ipynb', '.cu', '.c', '.cpp', '.h', '.rs'} or name in {
+            if path.suffix in {'.py', '.sh', '.ipynb', '.cu', '.c', '.cpp', '.h', '.rs', '.pyx', '.pxd', '.so', '.pyd'} or name in {
                 'pyproject.toml', 'uv.lock', '.python-version'
             }:
                 result[str(path.relative_to(ROOT))] = sha256(path)

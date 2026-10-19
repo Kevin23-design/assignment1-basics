@@ -1069,3 +1069,86 @@ uv run pytest -q tests/test_task1_encode_transport.py
 
 `--development --no-wandb --repeats 1` 仅用于匹配 development 前阶段报告的小文本流程，
 不能将其产物当作正式成绩。
+
+### 任务一：Cython 解码、未命中编码热点探索
+
+`benchmark_task1_native.py` 在 `exploration` 比较 B0、CY-D、CY-ED，不训练词表，
+不改变默认 BPE、序列化格式或课程入口。B0 来自先前验收通过的 **R0 源码快照**，
+不是报告被 W&B 上传异常标为未完成的 T0–T3 运行。
+
+| 候选 | 编码 | 解码 |
+|---|---|---|
+| B0 | R0 直接 worker、并发启动 | C2 |
+| CY-D | 与 B0 相同 | 原生双遍批量解码 |
+| CY-ED | 原生未命中合并核心，保留缓存和并行框架 | 原生双遍批量解码 |
+
+依赖只安装到个人 conda base；继续使用你现有的 base 与课程环境组合。
+不必为本实验更换项目构建后端，或重新安装 PyTorch、NumPy、Tokenizer：
+
+```bash
+conda install -n base -c conda-forge \
+  "cython>=3.1,<4" setuptools wheel c-compiler
+
+conda activate base
+source /env/activate_a1.sh
+
+python -c "import sys, Cython, setuptools; print(sys.executable); print(sys.version); print('Cython:', Cython.__version__)"
+```
+
+随后始终使用上述同一个 `python` 编译和运行。要求 CPython 3.12/3.13；环境组合后
+若无法导入 Cython，先修正激活顺序，不要用另一个 Python 编译来绕过问题。
+
+```bash
+python build_task1_native.py \
+  --output-dir outputs/task1-native-build
+
+python benchmark_task1_native.py \
+  --previous-selection outputs/task1-decode-exploration/selection.json \
+  --plain-confirmation outputs/task1-plain-confirmation/confirmation.json \
+  --build-dir outputs/task1-native-build \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-native
+```
+
+构建和实验输出目录均须不存在。前阶段报告引用的云端原文、分词器、参考 ID 和源码
+快照须保留；默认继承同一组 16 核和 16 workers、256 安全分片、每 worker 1M
+清空缓存。线程数为 1、GPU 隐藏。扩展只在显式构建命令中编译；实验不自动安装、
+编译或因扩展缺失而静默回退。修改 `.pyx` 后须使用新目录重新构建。
+
+每轮先对 B0/CY-D 各做五次交错测速及五对独立复测。CY-D 完整耗时中位数降低至少
+3%、且赢得至少 4/5 对时，才对 CY-D/CY-ED 执行同样流程。否则不测 CY-ED。
+推荐方案独立确认后，再做五对普通接口接入验收：中位数不超过实验路径 103%，
+且至少 4/5 对不超过对应实验路径 105%。诊断另跑，不参与排名。
+
+计时包含公开 encode、完整 `list[int]`、decode、原文比较，以及模块首次加载、
+原生查找表建立、运行分配、进程启动/传输/退出/清理。文件读取、词表加载、预编译
+和参考核对在计时外。每次完整核对 66,401,098 个 ID；失败立即停止。
+原生解码单线程持有 GIL，直接检查 list ID、累计长度、一次分配并 memcpy，最后
+整体 UTF-8 replace 解码；不读取 encode 原文。稀疏词表或非普通整数走兼容路径，
+但完整候选测速明确检查实际 native 后端。编码使用整数符号和 C 哈希 rank 表，
+沿用扫描最低 rank、批量合并非重叠 pair 的原算法；不引入堆或链表。
+
+普通接口验收通过后，单独执行活跃 W&B 确认：
+
+```bash
+python benchmark_task1_native.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-native/selection.json \
+  --output-dir outputs/task1-native-plain-confirmation
+```
+
+需要保留构建目录和候选源码快照。一个 `bpe-task1-native-exploration` W&B run
+覆盖探索；确认另建 `bpe-task1-plain-confirmation` run。记录 `.pyx`/`.pxd`、生成 C、
+构建脚本、扩展二进制及 SHA-256，Python ABI、Cython、编译器和编译参数；
+二进制上传为文件，不当作 UTF-8 源码打印。普通接口核对实际扩展路径及 ABI。
+上传异常写 `upload_failure.json`、`upload_status=failed`，与计算失败分开；
+`submitted` 表示已交给 W&B 客户端，并非远端文件独立验收。原始历史报告不作修改。
+
+本地只做小规模测试，不以小文本速度判断提升；完整成绩留在云端：
+
+```bash
+python -m pytest -q tests/test_task1_native.py
+```
+
+加载旧词表的探索/确认不替代课程训练入口成绩，不自动更新 `dev`，也不预设能达到 5 秒。
