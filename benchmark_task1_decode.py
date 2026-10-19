@@ -324,7 +324,7 @@ def exploration(args):
         except BaseException as error:
             common.save_json(out / 'failure.json', {'error': repr(error), 'completed': False})
             if run is not None:
-                run.summary.update(completed=False, error=repr(error))
+                run.summary.update({'completed': False, 'error': repr(error)})
             raise
     print(f'Completed: {out / "report.md"}', flush=True)
 

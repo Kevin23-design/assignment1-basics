@@ -257,8 +257,8 @@ def publish(run, out, rows, selection):
                'roundtrip_passed', 'cpu_affinity', 'parent_peak_rss_bytes', 'encode_worker_peak_rss_max',
                'encode_worker_peak_rss_sum', 'error']
     run.log({'encode_transport/trials': wandb.Table(columns=columns, data=[[r.get(k) for k in columns] for r in rows])})
-    run.summary.update(completed=True, training=False, recommended=selection['recommended'],
-                       integration_passed=selection['integration']['passed'], submission_provenance_verified=False)
+    run.summary.update({'completed': True, 'training': False, 'recommended': selection['recommended'],
+                        'integration_passed': selection['integration']['passed'], 'submission_provenance_verified': False})
     baseline = json.loads((out / 'manifest.json').read_text())['baseline_snapshot']
     for label, snapshot in [('accepted-baseline', baseline), ('plain-candidate', selection['snapshot'])]:
         artifact = wandb.Artifact(f'{label}-{run.id}', type='source-code')
@@ -349,7 +349,7 @@ def exploration(args):
             record_outputs(out, rows, selection)
             common.save_json(out / 'failure.json', {'completed': False, 'error': repr(error)})
             if run is not None:
-                run.summary.update(completed=False, error=repr(error))
+                run.summary.update({'completed': False, 'error': repr(error)})
             raise
     print(f'Completed: {out / "report.md"}', flush=True)
 
