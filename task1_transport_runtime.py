@@ -240,11 +240,18 @@ def pipe_worker(index, cpu, request, output):
     attached = []
     try:
         affinity([cpu] if cpu is not None else [])
+        rebuilding = stamp(diagnostic)
         tokenizer = BPE(*request['state'])
+        elapsed(stats, 'tokenizer_rebuild_seconds', rebuilding, diagnostic)
         shared = request.get('shared')
         if shared:
             attached = [shared_memory.SharedMemory(name=shared[key], track=False) for key in ('input', 'output')]
-        output.send(('ready', index, worker_ready(index, diagnostic)))
+        ready = worker_ready(index, diagnostic)
+        if diagnostic:
+            ready.update(ready_clock=time.perf_counter(),
+                         init_receive_seconds=request.get('_receive_seconds', 0.),
+                         tokenizer_rebuild_seconds=stats['tokenizer_rebuild_seconds'])
+        output.send(('ready', index, ready))
         while True:
             start = stamp(diagnostic)
             kind, part, data = output.recv()

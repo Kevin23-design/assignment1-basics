@@ -811,3 +811,96 @@ python -m pytest tests/test_peak_lr_single_suite.py tests/test_context_lr_experi
   tests/test_best_lr_reference_suite.py tests/test_optimizer_batch_suite.py tests/test_training.py \
   tests/test_optimizer.py tests/test_tokenizer.py tests/test_train_bpe.py tests/test_parallel_bpe_experiment.py -q
 ```
+
+## 任务一：启动并发化 × 解码优化（不重新训练）
+
+新增 `benchmark_task1_pipeline.py` 与实验专用 `task1_pipeline_runtime.py`，仅在
+`exploration` 探索，不改 `dev`、`bpe.py`、课程模板 `train_bpe.py` 或 Transformer 入口。
+**只加载 `outputs/8b68b68e0cbe/tokenizer`，不调用 BPE.train()。** 旧传输工具的正常测速
+路径不变；辅助 worker 仅在诊断时增加初始化接收、BPE 重建及就绪时间记录。
+
+实验启动时读取上一轮 `manifest.json` / `selection.json`，确认推荐 D、原 16 workers /
+256 分片 / 1M 缓存 / 128K 解码块配置，并比对完整验证原文及三个 tokenizer JSON 的
+SHA-256。旧文件可位于不同绝对路径，按旧清单的文件名和指纹识别；不允许静默换词表。
+历史约 **15.622 秒**只作参考，最终推荐依据本轮新测 D0，不能拿历史成绩直接排名。
+
+第一阶段为四种完整解码专项，每种 3 次，新进程、固定种子交错执行：
+
+| 解码 | 方法 |
+|---|---|
+| C0 | 当前字典查找 / map / 分块 join |
+| C1 | 稠密查找表 / map / 分块 join |
+| C2 | 字典 / 标准库 operator.itemgetter 批量查找 |
+| C3 | 稠密查找表 / operator.itemgetter 批量查找 |
+
+查找表、索引及临时对象均在解码计时内构造；所有方案拼接原始 bytes 后才做一次 UTF-8
+解码（errors=replace），保留空、单 ID、稀疏词表和非法 ID 行为，不拼接单 token 解码文本。
+解码块固定 131,072 IDs。从 C1–C3 中选解码中位数最快者 Q，进入完整接口消融；即使 Q
+在专项慢于 C0，仍进入完整消融检查实际 encode 产物上的效果，不直接据专项推广。
+**12 次解码专项不属于任务一完整成绩。** 装载参考 IDs 在专项计时之外，不预解码文本。
+
+第二阶段使用以下四种组合，每种 5 次：
+
+| 方案 | 初始化 | 解码 |
+|---|---|---|
+| D0 | 当前 D：启动一个 worker 后同步发送状态 | C0 |
+| D1 | 先创建全部 worker，再发送初始化状态 | C0 |
+| D2 | 当前 D | Q |
+| D3 | 先创建全部 worker，再发送初始化状态 | Q |
+
+固定 16 workers、256 个安全分片、每 worker 1M 满后清空缓存。全部 worker 就绪后，
+沿用 D 的动态任务分发与按编号组装结果。不会直接 fork 已启动 W&B 的多线程进程。
+
+每次完整正常计时为 **BPE.encode → 完整 list[int] → BPE.decode → 原文比较**，包括
+分片、启动、状态传输与重建、编码、结果传输、列表组装、退出及清理。使用刚加载的 BPE，
+空缓存、冷 worker；不在计时前启动进程或准备完整编码/解码结果。只预先加载分词器和
+读取原文。每次子试验模拟课程调用方导入 W&B，但不单独创建 run。
+
+20 次筛选采用固定种子交错顺序，最快候选与 D0 再做 5 对独立复测，每对随机先后。
+至少降低总耗时中位数 **3%** 且赢得至少 **4/5 对**才推荐替换，否则保留 D0。
+D0 本身最快则跳过自身配对。最终推荐另做一次独立完整确认，不挑最快单次。
+最多 31 次完整正常测速，另有 12 次解码专项、最多 2 次独立诊断和一次可选参考编码。
+
+所有完整候选都必须通过 **66,401,098 个 ID** 的完整精确对照和全文还原，任何错误立即
+停止。默认串行核心独立生成一次临时 uint32 little-endian 参考，**仅编码，不训练**；
+若已有这套词表对应的可信完整参考文件，可传 `--reference-tokens` 直接复用（应为
+265,604,392 bytes）。公共数据只读，临时参考位于个人 outputs，完成或失败后清理。
+仅 token 数一样不足以认定参考正确，最终仍精确对照每一个 ID。
+
+独立诊断记录每个进程创建、初始化序列化/发送、接收与重建、就绪、首个结果、编码与打包、
+等待、组装、退出、解码建表/索引/查找/拼接/UTF-8、CPU affinity 和 RSS。为拆分查找与
+拼接，解码诊断物化临时元组，分配模式与正常测速不同，不能排名。跨进程时间重叠，
+不能相加；发送/接收包含序列化、阻塞或等待。worker 峰值之和不是同时发生的实际峰值。
+
+云端整个探索串行使用相同的前 16 个允许逻辑 CPU，也可指定恰好 16 个 `--cpu-ids`；
+不足直接报错，不降配。父进程与后台记录服务受 affinity 限制；worker 各绑定一个 CPU，
+线程变量为 1，GPU 隐藏。worker 异常、中断或初始化部分失败均终止并回收所属进程，
+不返回部分列表。只创建一个 `bpe-task1-pipeline-exploration` W&B run，保存完整源码、
+配置、候选 Table 和结果。个人输出保存指纹、实际顺序、逐次 JSON、CSV、报告和选优；
+原文、词表、历史清单、参考或本轮源码发生变化时不产生有效推荐。
+
+云端命令（先配置个人 W&B 环境变量，输出目录须不存在）：
+
+```bash
+source /env/activate_a1.sh
+
+python benchmark_task1_pipeline.py \
+  --tokenizer-prefix outputs/8b68b68e0cbe/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --previous-results-dir outputs/task1-transport-exploration \
+  --decoder-repeats 3 \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-pipeline-exploration
+```
+
+`--previous-results-dir` 指向云端已有上一轮清单及选优报告的目录；如果历史文件移到了
+其他目录，修改此路径即可，不需要重新跑旧实验或重新训练。只有输入指纹完全一致才继续。
+实验只报告推荐，不自动更新 dev，不承诺达到 5 秒，也不替代课程入口正式 W&B 成绩。
+
+本地仅小文本检查（开发模式使用 2 workers，禁止用于正式成绩）：
+
+```bash
+python -m pytest tests/test_task1_pipeline.py tests/test_task1_transport.py \
+  tests/test_task1_efficiency.py tests/test_tokenizer.py tests/test_train_bpe.py -q
+```
