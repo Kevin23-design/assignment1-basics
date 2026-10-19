@@ -2,7 +2,7 @@
 
 正式源码包括 `bpe.py`、`train_bpe.py`、`transformer_module.py`、
 `transformer_main.py`、`parallel_bpe_encoding.py`、`bpe_memory_runtime.py` 和课程提供的 `wandb_record.py`。
-模型核心、BPE 训练/合并规则和课程源码记录器保持不变。
+模型核心和BPE训练/合并规则保持不变；记录器增加原生源码、构建清单与二进制覆盖。
 
 ## 环境与运行
 
@@ -16,66 +16,62 @@ export WANDB_MODE="online"
 export PYTHONIOENCODING="utf-8"
 ```
 
-任务一入口：
+任务一正式入口继续保持课程 `train_bpe.py` 模板。Cython 使用依据为你在本次会话确认的课程明确许可；粘贴版允许列表本身未写明 Cython。
 
-```sh
-python train_bpe.py
+另：此前你提过禁止AI生成核心代码，本次优化含AI辅助实现；若该条仍适用，Cython许可不能替代代码来源许可。详见[BPE_Q3_REVIEW.md](BPE_Q3_REVIEW.md)。
+
+现接入第 6 轮最快候选 **Q3**：16 workers / 256 安全分片 / 每 worker 1M 满后清空缓存；
+先派发下一任务，再处理当前结果；按实际返回数组长度分配最终完整 `list[int]`，不按参考 token 数预分配。
+解码使用 N2：在本次 `decode()` 内验证并建立 uint32 索引，拼接 bytes 后完整 UTF-8 `errors="replace"` 解码；
+不使用 encode 时的原文或保留数组。公开接口、词表/merges/特殊 token JSON 格式不变。
+默认惰性 `encode_iterable()` 保留原 Python 合并核心与 2K 缓存，避免为流式接口增加原生合并表的内存。
+
+**结果范围须区分：**Q0/Q3 配对中位数 **6.127/5.676 秒**，降低 **7.36%**，5/5 胜出；
+独立确认 **5.449 秒**，普通接口接入中位数 **5.701 秒**。接入中位数比例满足门槛，但仅 **3/5** 对满足单对105%限制，
+未达到4/5要求，`integration.passed=false`；本轮未提供活跃 W&B 独立确认。Q3是当前最快候选，
+**不是已经完整通过接入稳定性验收或已经取得的新正式成绩**。不放宽门槛、不改写历史报告，云端还需复核。
+
+所有自编 Python/`.pyx` 源码放在项目目录。`build_bpe_native.py` 显式编译三个独立扩展到项目内
+`bpe_native/`，包括输入源码副本、生成 C、ABI/编译器/参数/指纹清单及二进制；不依赖 `outputs` 中的探索快照。
+该生成目录不提交 Git，但课程记录器明确收录其中源码、清单和二进制，不受 Git ignore 影响。
+首次扩展导入、worker 原生表准备、所有进程启动/退出和最终列表组装仍在公开接口计时内。
+不自动编译；源文件、ABI或编译产物变化会明确报错。构建检查不导入扩展或编码任何文本。
+
+使用你已确认的个人解释器，**不修改公共环境或项目依赖文件**；不使用裸 `python` 或 `uv run`：
+
+```bash
+source /env/activate_a1.sh
+bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
+
+# 首次编译；已有且完全匹配则复用。源码变化后显式添加 --rebuild。
+"$bpe_python" build_bpe_native.py
+"$bpe_python" build_bpe_native.py --check
+
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
+bpe_cpus="$("$bpe_python" -c 'import os; c=sorted(os.sched_getaffinity(0)); assert len(c)>=16, "需要至少16个允许CPU"; print(",".join(map(str,c[:16])))')"
+
+# 在 W&B 服务启动前即固定16核，隐藏GPU；缺少原生构建时不允许回退冒充Q3。
+taskset -c "$bpe_cpus" env CUDA_VISIBLE_DEVICES="" BPE_REQUIRE_NATIVE=1 \
+  "$bpe_python" train_bpe.py
 ```
 
-完整文本编码保留 **1,048,576 项、满后整体清空** 的缓存；只缓存不超过 128 字符的
-普通预分词片段。正式入口保持课程提供的固定配置与 encode/decode 调用流程。
-流式 `encode_iterable()` 继续使用独立的 2,048 项缓存。
+运行前仍需设置个人 `WANDB_ENTITY`、`WANDB_PROJECT`、`STUDENT_ID` 并登录个人账号。
+正式入口从完整 `/data/assignment1-data/owt_train.txt` 训练、保存并重新加载，完整读取验证原文；
+评分计时仅包含 `encode → 完整list[int] → decode → 原文比较`，200 token详情与上传在计时后。
+BPE训练没有六小时时限；Transformer的六小时规则不改。最终以新run的 `bpe/valid_seconds` 作为成绩。
+任务一正式来源凭证是这次完整训练的 W&B run，旧词表的测速记录不能替代其训练来源证明。
 
-云端三轮缓存探索中，1M 清空策略中位数为 41.499 秒；1M 停止新增为 41.728 秒，
-1M LRU 为 51.577 秒，全部通过完整 ID 对照与全文还原。1M 实际缓存 627,462 项，
-未触发容量上限，因此本次无法比较它与停止新增策略在满后的行为。当前继续保留原策略。
-以上是探索结果，最终提交仍使用正式 W&B 验证记录。
+没有构建且未设 `BPE_REQUIRE_NATIVE=1` 时保留原 Python 兼容路径；`BPE_PYTHON_ONLY=1` 可显式使用它。
+两者同时设置会报错。正常构建后默认使用Q3，正式命令显式要求原生，防止无意跑成较慢的兼容实现。
+小文本、无足够安全切点、非Linux或非连续uint32 ID保留串行兼容语义；有足够切点而不足16核时不静默降配。
+分片仅在实际匹配的完整特殊 token 后，较长标记优先，worker不导入W&B/Transformer，不使用fork或协调层。
+异常或信号会回收全部本次worker，不返回部分ID。公共数据只读，不生成额外标记，不调用第三方Tokenizer。
 
-任务一正式入口 `train_bpe.py` 按课程模板保留：先训练并保存、重新加载、读取全文，
-再计时执行 `bpe.encode(text)`、`bpe.decode(ids)` 和原文比较；前 200 token 展示及上传
-在计时后。数据路径固定为公共 OWT 原文，运行 `python train_bpe.py`，不附加路径或 worker
-参数。最优参数现已封装在 `BPE` 内部：**16 workers / 256 个安全分片 / 131,072 IDs 解码块**。
-`encode()` 仍返回完整 `list[int]`，`decode()` 先拼接全部 bytes，再进行一次 UTF-8 解码，
-非法序列使用 `errors="replace"`。不修改公开接口或特殊 token 的序列化格式。
+本地只跑小文本；Linux affinity与官方1MB流式内存限制需在云端确认：
 
-大于等于 8 Mi 字符的完整文本在 Linux 上自动尝试并行；切点只能在分词器实际识别到的
-完整特殊 token 后，遵守较长标记优先，不限于某个写死的标记。OWT 默认特殊清单仅包含
-`<|endoftext|>`，其 256 分片口径与探索相同。小输入、没有足够安全切点、非 Linux 环境
-或超出 uint32 范围的自定义 ID 保留串行编码行为。能够安全分片而允许 CPU 不足 16 个时
-明确报错，不自动减核；worker 运行失败也不会悄悄串行重跑。
-
-父进程及记录服务限定在前 16 个允许的逻辑 CPU 内，worker 各固定一个。调用进程直接
-管理 16 个独立轻量 Python worker 入口，动态分发分片并接收结果；不使用 fork，也不经
-协调进程转发全文及结果，避免重新导入模板顶层的 W&B。子进程启动环境在导入前设置
-底层线程为 1、隐藏 GPU，调用者的 GPU 可见性和线程环境变量不变。worker 从当前词表、
-合并规则和完整特殊清单重建空缓存 BPE，不依赖磁盘前缀继续存在，不缓存进程池。
-原文分片和 uint32 结果通过内存 IPC，不生成临时 token 文件。结果按原始分片顺序组装，
-异常不返回部分结果，并终止、回收全部本次 worker。分片、启动、状态传输、列表组装、
-全部 worker 退出及资源清理都包含在 `encode()` 中。
-
-接入层探索 run `55fd546b1d2f` 固定相同 16 核和上述参数，筛选中位数如下：
-
-| 方案 | 完整 encode＋decode＋比较中位数（秒） |
-| --- | ---: |
-| B：原协调转发 | 18.549 |
-| R：及时转发 | 18.041 |
-| S：共享内存 | 16.667 |
-| D：直接轻量 worker | 15.425 |
-
-独立配对复测中 B / D 中位数为 **18.576 / 15.414 秒**，D 耗时降低 **17.02%**，
-5/5 对胜出，达到至少 3% 且至少 4/5 对胜出的预设门槛。D 独立确认 **15.622 秒**。
-全部候选通过 66,401,098 个 ID 的精确对照与全文还原，源码及输入指纹未变。
-收益主要体现在编码阶段，不能将重叠的诊断分项相加或全部归因于减少复制。
-当前移植 D，缓存、分片及解码参数保持不变。
-
-**15.622 秒是探索确认结果，不是同步后正式入口的新成绩，也未恢复历史探索的约 12 秒。**
-云端仍需执行 `python train_bpe.py` 完成训练、保存、重新加载和完整验证，以该次 W&B 的
-`bpe/valid_seconds` 作为正式成绩。探索工具保留在 `exploration`，任务二配置不变。
-
-本地仅小文本检查：
-
-```sh
-python -m pytest tests/test_bpe_memory_runtime.py tests/test_tokenizer.py tests/test_train_bpe.py -q
+```bash
+"$bpe_python" -m pytest tests/test_bpe_native_integration.py tests/test_tokenizer.py tests/test_train_bpe.py -q
 ```
 
 任务二只修改 `transformer_main.py` 顶部的 `CONFIG` 字典，然后在项目根目录执行：

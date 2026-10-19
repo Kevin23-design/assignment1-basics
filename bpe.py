@@ -61,6 +61,13 @@ class BPE:
         self._max_special = max(map(len, ordered), default=0)
         self._ranks = {pair: rank for rank, pair in enumerate(self.merges)}
         self._cache: dict[str, tuple[int, ...]] = {}
+        self._native_encoder_state = None
+        self._native_encode_metrics = None
+        from bpe_native_deployment import enabled
+        self._use_native = enabled()
+        self.__dict__.pop('_encode_uncached', None)
+        if not self._use_native:
+            self._encode_uncached = self._python_encode_uncached
 
     def _pieces(self, text):
         """先隔离特殊 token，再匹配普通文本；返回特殊标志及起止位置。"""
@@ -178,9 +185,10 @@ class BPE:
         cached = self._cache.get(piece)
         if cached is not None:
             return cached
-        return self._encode_uncached(piece, _STREAM_CACHE_CAPACITY)
+        # Keep the default lazy stream free of native merge-table allocations.
+        return self._python_encode_uncached(piece, _STREAM_CACHE_CAPACITY)
 
-    def _encode_uncached(self, piece, cache_capacity=CACHE_CAPACITY):
+    def _python_encode_uncached(self, piece, cache_capacity=CACHE_CAPACITY):
         """缓存未命中时按训练得到的合并优先级编码，并缓存符合长度限制的结果。"""
         symbols = [_BYTES[b] for b in piece.encode("utf-8")]
         while len(symbols) > 1:
@@ -209,6 +217,10 @@ class BPE:
                 self._cache.clear()
             self._cache[piece] = ids
         return ids
+
+    def _encode_uncached(self, piece, cache_capacity=CACHE_CAPACITY):
+        from task1_native_runtime import encode_uncached
+        return encode_uncached(self, piece, cache_capacity)
 
     def encode(self, text: str) -> list[int]:
         if len(text) >= _PARALLEL_MIN_CHARACTERS and self._special_re:
@@ -253,6 +265,12 @@ class BPE:
                 yield from self._encode_piece(piece)
 
     def decode(self, ids: list[int]) -> str:
+        if not self._use_native:
+            return self._python_decode(ids)
+        from task1_decode_access_runtime import decode
+        return decode(self, ids, 'N2', diagnostic=False)
+
+    def _python_decode(self, ids: list[int]) -> str:
         lookup = self.vocab.__getitem__
         if len(ids) <= _DECODE_BLOCK_SIZE:
             return b"".join(map(lookup, ids)).decode("utf-8", errors="replace")
@@ -287,6 +305,8 @@ class BPE:
         if loaded._special_ids != config["special_token_ids"]:
             raise ValueError("Special token IDs do not match the saved configuration")
         self.__dict__.update(loaded.__dict__)
+        if not self._use_native:
+            self._encode_uncached = self._python_encode_uncached
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
