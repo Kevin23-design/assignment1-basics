@@ -1008,3 +1008,64 @@ python -m pytest tests/test_task1_decode.py tests/test_task1_pipeline.py \
   tests/test_task1_transport.py tests/test_task1_efficiency.py \
   tests/test_tokenizer.py tests/test_train_bpe.py -q
 ```
+
+### 任务一：T0–T3 编码传输探索（不重新训练）
+
+`benchmark_task1_encode_transport.py` 从前一轮 `selection.json` 和活跃 W&B 的
+`confirmation.json` 继承并核对分词器、完整验证原文、参考 ID、CPU 集合及源码快照。
+T0 使用验收通过的普通 R0 快照，不使用项目当前默认 BPE 代替历史基线；
+T1 在每次 encode 内只序列化一次公共词表状态，T2 增加每 worker 共享输出槽位，
+T3 再增加共享 UTF-8 输入。四项都使用直接轻量 worker、并发启动及 C2 解码，
+没有协调进程、预热进程池或新的编译依赖。
+
+```bash
+source /env/activate_a1.sh
+
+python benchmark_task1_encode_transport.py \
+  --previous-selection outputs/task1-decode-exploration/selection.json \
+  --plain-confirmation outputs/task1-plain-confirmation/confirmation.json \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-encode-transport
+```
+
+前阶段报告内的云端绝对路径及源码快照必须仍存在；本地下载的结果目录不能直接替代
+云端源码快照。输出目录须不存在。默认继承相同的 16 个逻辑 CPU，`--cpu-ids` 只能
+显式重申同一集合，不能更换资源。各 worker 绑定一个 CPU，内部线程为 1，GPU 隐藏。
+T2/T3 需要 Python 3.13+；计时内检查 `/dev/shm` 的实际需求和 64 MiB 余量，
+不足时标记不可用并排除该候选，不回退成管道实现。
+
+每次使用新子进程、重新加载词表及空缓存；完整计时公开 encode、完整 `list[int]`、
+decode 和原文比较，包括共享内存准备、状态序列化、进程启动、传输、列表组装、
+退出与清理。参考 ID 的完整精确比较在计时外执行，正常验证必须为 66,401,098 个 ID。
+共享输出被复制为父进程独立持有的数组后才允许 worker 复用槽位；解码不读取原文缓存。
+异常或中断会回收所属 worker 并释放共享内存，不返回部分列表。
+
+流程为基线诊断、四项各五次交错筛选、最快新候选诊断、与基线五对独立复测及一次确认。
+中位数降低至少 3% 且至少胜出 4/5 对才推荐替换，否则保留 T0。随后自动生成普通 BPE
+源码快照并做五对接入验收：普通路径中位数不超过实验路径的 103%，且至少 4/5 对不超过
+对应实验路径的 105%。诊断不参与排名，跨进程阶段不能相加解释总时间；worker 峰值 RSS
+之和也不代表同时发生的实际峰值。
+
+接入门槛通过后，单独执行活跃 W&B 确认（不再次启动探索 run）：
+
+```bash
+python benchmark_task1_encode_transport.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-encode-transport/selection.json \
+  --output-dir outputs/task1-encode-transport-plain-confirmation
+```
+
+探索创建一个 `bpe-task1-encode-transport-exploration` W&B run，确认再创建一个
+`bpe-task1-plain-confirmation` run；记录完整源码、配置、候选 Table、JSON/CSV/Markdown
+及指纹。始终不训练、不修改 `train_bpe.py`、默认 BPE 或 `dev`。加载旧词表的探索及
+确认不替代课程训练入口成绩，也不预先承诺低于 5 秒。
+
+本地小文本检查：
+
+```bash
+uv run pytest -q tests/test_task1_encode_transport.py
+```
+
+`--development --no-wandb --repeats 1` 仅用于匹配 development 前阶段报告的小文本流程，
+不能将其产物当作正式成绩。
