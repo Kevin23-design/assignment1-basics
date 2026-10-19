@@ -904,3 +904,107 @@ python benchmark_task1_pipeline.py \
 python -m pytest tests/test_task1_pipeline.py tests/test_task1_transport.py \
   tests/test_task1_efficiency.py tests/test_tokenizer.py tests/test_train_bpe.py -q
 ```
+
+## 任务一：批量／并行解码与普通 BPE 接入验收
+
+新增 `benchmark_task1_decode.py`，只在 `exploration` 探索。继续加载
+`outputs/8b68b68e0cbe/tokenizer`，**不重新训练、不修改项目的 bpe.py、dev 或课程模板**。
+上一轮 D3/C2 确认约 11.167 秒；本轮锁定其并发启动、16 编码 workers、256 安全分片、
+每 worker 1M 清空缓存及全部合并规则。历史成绩不参与新排名，重新测 R0 基线。
+
+第一阶段比较六种解码，各 3 次，固定种子交错、新进程运行：
+
+| 方法 | 实现 |
+|---|---|
+| R0 | 上一轮 C2，131,072 IDs 一块 |
+| N128 | NumPy object 词表，批量索引；每块 131,072 IDs |
+| N1M | 同上，每块 1,048,576 IDs |
+| P4 / P8 / P16 | 新建 4 / 8 / 16 个独立轻量解码 worker |
+
+NumPy 为项目已有依赖，不安装新依赖或替代 Tokenizer。使用 object 保存原始 bytes，
+保留零字节，不使用会改变尾部零字节的定长字符串表示。建表、ID 转换与合法性检查、
+索引、tolist、拼接全部计时；禁止浮点截断、负索引和整数溢出改变 ID。非连续词表及
+小输入保留 C2 的轻量行为。计时前不人为预热 NumPy，记录它是否已由调用方加载及
+计时期间新增模块；首次导入发生在计时内时也计入。
+
+并行解码每任务固定 1,048,576 IDs，worker 内按 131,072 IDs 查找、拼接并返回 bytes。
+worker 只用标准库，不导入 BPE、merges、W&B、模型或 NumPy。按编号汇总后才做统一
+UTF-8 解码（errors=replace），不拼接逐 token/分块解码字符串。打包、创建、初始化、
+IPC、组装、退出和清理全部在 decode 内；不复用编码进程池或 encode 保存的原文、ID
+副本、还原结果缓存。decode 仅依据其 IDs 与当前词表工作。
+
+这 **18 次解码专项不是完整成绩**。各选最快 NumPy 和最快并行方法进入第二阶段，
+与 R0 共三组；编码全部固定 D3。每组 5 次完整
+**encode → 完整 list[int] → decode → 原文比较**，再将最快候选与 R0 做 5 对独立复测。
+至少降低中位数 3% 且至少 4/5 对胜出才推荐；R0 最快则跳过自身配对。最终推荐再做
+一次独立完整确认。最多 26 次这一阶段的完整正常测速，诊断另外进行、不能排名。
+当前编码本身约 6.34 秒，本轮不承诺进入总耗时 5 秒。
+
+第三阶段在本次个人 outputs 下生成 `plain-source` 独立源码快照，固化推荐私有后端：
+普通 `from bpe import BPE`、load/encode/decode 不执行 selected_backend/selected_pipeline
+替换，也不增加协调层。encode 的启动使用同一并发启动实现；小输入保留轻量路径，
+不为前 200 token 展示启动 worker。BPE 训练、合并、预分词、构造与序列化不变，
+encode_iterable 继续 2K 缓存。该快照不覆盖项目源文件，并验证课程模板逐字节不变。
+
+普通路径与实验推荐路径再做 5 对交错复测。普通路径中位数须≤实验路径 103%，并至少
+4/5 对≤对应实验路径 105%。不满足则 `ready_for_plain_confirmation=false`，记录回退而
+不宣称接入完成。生成的候选源码与来源哈希完整上传单独 source-code artifact，包含
+未修改的课程源码记录器。运行过程中和后续确认都核对同一份快照，禁止临时修改。
+
+云端探索命令（预先配置个人 W&B 环境，输出目录须不存在）：
+
+```bash
+source /env/activate_a1.sh
+
+python benchmark_task1_decode.py \
+  --phase exploration \
+  --tokenizer-prefix outputs/8b68b68e0cbe/tokenizer \
+  --valid-file /data/assignment1-data/owt_valid.txt \
+  --previous-results-dir outputs/task1-pipeline-exploration \
+  --decoder-repeats 3 \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-decode-exploration
+```
+
+上一轮目录须含 manifest.json / selection.json，且推荐已完成的 D3/C2。按原文及三个
+分词器文件的 SHA-256 校验，可移动文件路径但不能换词表或原文。全部候选必须逐项
+对照 **66,401,098 IDs** 并还原全文，任何正确性失败立即停止。支持 `--reference-tokens`
+复用该词表对应的可信 uint32 little-endian 完整 ID 文件；否则只用串行核心生成一次参考，
+不训练。默认保留本次 outputs/reference.u32le（约 265.6 MB）供独立确认，第二阶段前
+不要删除该文件、探索目录、候选快照或原文/词表。提供外部参考时也须保留其原路径。
+
+接入门槛通过后，单独执行活跃 W&B 上下文确认：
+
+```bash
+python benchmark_task1_decode.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-decode-exploration/selection.json \
+  --output-dir outputs/task1-plain-confirmation
+```
+
+确认继承并核对第一阶段实际输入路径、参考、候选源码及同一组 CPU；仍只加载旧词表。
+独立普通验证进程先建立真实活跃的 W&B run，再导入候选 BPE、加载词表和读取原文，
+计时只涵盖完整公开 encode/list/decode/比较，首次运行模块导入仍照常计入。记录实际
+BPE 来源、计时前模块、计时中新导入模块、活跃状态、RSS 和完整正确性，不用实验替换。
+第二个 run 的 job_type 为 `bpe-task1-plain-confirmation`，课程记录器直接保存完整候选
+源码，并展示前 200 token；探索 run 为 `bpe-task1-decode-exploration`。仅这两个独立 run，
+不为每个测速子进程建立 run。确认比接入中位数慢超过 5% 时标记上下文回退，单次结果
+不作稳定性证明，不自动修改 dev，也不冒充要求重新训练的课程入口记录。
+
+全程 GPU 隐藏，默认固定当前允许的前 16 个逻辑 CPU；可给恰好 16 个 `--cpu-ids`。
+编码与解码 worker 不重叠，每个 worker 绑定一个 CPU、内部线程 1，不超 16 核。
+不允许资源不足静默降配或按失败结果选优；部分启动失败、worker 异常和中断均回收
+所属进程，不返回部分列表。公共数据只读，临时产物和源码快照均在个人 outputs。
+分阶段报告区分解码专项、完整接口、接入配对和活跃确认；独立诊断记录建表、转换、
+打包、启动、查找、IPC、拼接、UTF-8 和内存，重叠时间不能相加，RSS 独立峰值之和
+不是同时发生的真实峰值。源码、原文、词表、历史清单或参考改变则结果无效。
+
+本地只做小文本测试；开发模式限制为 2 workers，并标记不可当作正式资源/成绩。
+小文本活跃 W&B 测试采用 offline 模式，不上传：
+
+```bash
+python -m pytest tests/test_task1_decode.py tests/test_task1_pipeline.py \
+  tests/test_task1_transport.py tests/test_task1_efficiency.py \
+  tests/test_tokenizer.py tests/test_train_bpe.py -q
+```
