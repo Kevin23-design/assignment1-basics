@@ -59,7 +59,7 @@ CONFIG = {
     "rope_theta": 10000,
     "batch_size": 64,
     "eval_batch_size": 16,
-    "learning_rate": 3e-4,
+    "learning_rate": 2e-3,
     "min_learning_rate": 3e-5,
     "warmup_steps": 500,
     "cosine_steps": 65000,
@@ -69,7 +69,7 @@ CONFIG = {
     "max_grad_norm": 1.0,
     "seed": 42,
     "max_train_seconds": 21600,
-    # 历史保存+完整验证约 174 秒；下一版基线固定预留 10 分钟。
+    # 历史保存+完整验证约 174 秒；固定预留 10 分钟。
     "reserve_seconds": 600,
     "resume": None,
     "resume_from_run": None,
