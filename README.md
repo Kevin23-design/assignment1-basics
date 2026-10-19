@@ -1152,3 +1152,67 @@ python -m pytest -q tests/test_task1_native.py
 ```
 
 加载旧词表的探索/确认不替代课程训练入口成绩，不自动更新 `dev`，也不预设能达到 5 秒。
+
+### 任务一：原生编码加载适配层复测（复用已编译扩展）
+
+`benchmark_task1_native_adapter.py` 继承上一轮完成的 CY-D 结果和活跃 W&B 确认，
+复用 CY-D、CY-ED 源码快照中的二进制，不安装依赖、不编译、不训练。A0 为原 CY-D；
+A1 从 CY-ED 派生，**仅替换私有 `load_native()`**：首次完成 ABI、二进制及实际加载
+路径核验后才缓存模块，后续直接返回，不再重复解析路径或读取元数据。原合并算法、
+缓存、统计、进程传输及解码保持不变。默认 BPE、旧探索工具和 `dev` 不变。
+
+固定解释器，避免课程环境抢占 PATH：
+
+```bash
+bpe_python="/home/zhangziyang/miniforge3/envs/bpe-native/bin/python"
+
+"$bpe_python" benchmark_task1_native_adapter.py \
+  --previous-selection outputs/task1-native/selection.json \
+  --plain-confirmation outputs/task1-native-plain-confirmation/confirmation.json \
+  --repeats 5 \
+  --diagnostics \
+  --output-dir outputs/task1-native-adapter
+```
+
+输出目录须不存在；前阶段原文、词表、参考、原构建文件和 CY-D/CY-ED 候选快照须保留。
+预检确认各组 `.pyx`、生成 C、二进制及 ABI 一致，继承同一组 16 CPU、16 workers、
+256 安全分片、每 worker 1M 清空缓存；线程数为 1，GPU 隐藏。不要使用裸 `python`
+或 `uv run` 来切换解释器；没有 `--build-dir` 或自动重编译入口。
+
+`--diagnostics` 对 A0、原 CY-ED、A1 各独立诊断一次。诊断使用独立源码快照，计数
+加载调用、ABI/二进制验证调用、实际路径解析及对应耗时，同时保留 worker 原生表
+构建、编码、传输、列表组装和解码数据。实际路径解析和验证耗时包含在加载耗时中，
+不能相加；诊断额外计数不进入排名。正常快照不安装诊断包装器或计数分支。
+
+正常流程为 A0/A1 各五次交错筛选、五对独立随机顺序复测、一次推荐方案确认，再做
+五对普通接口接入验收，共 31 次正常测速。原 CY-ED 只作诊断，不进入排名。
+推广要求完整中位数至少降低 3% 且胜出至少 4/5 对；否则保留 A0。接入要求普通
+路径中位数不超过实验路径 103%，且至少 4/5 对不超过对应实验路径 105%。每次
+使用新试验进程、空缓存，完整精确核对 66,401,098 个 ID 及全文还原；错误立即停止。
+首次扩展加载、状态准备、进程启动、传输、组装和清理均计入 encode/list/decode/比较。
+
+接入通过后，使用相同解释器独立确认：
+
+```bash
+"$bpe_python" benchmark_task1_native_adapter.py \
+  --phase plain-confirmation \
+  --selection-report outputs/task1-native-adapter/selection.json \
+  --output-dir outputs/task1-native-adapter-plain-confirmation
+```
+
+报告以 A0/A1 标记方案，原生后端元数据仍保留 CY-D/CY-ED；独立确认增加
+`adapter_case` 标记。活跃 W&B 超过接入中位数 5% 时保留回退标记；上一轮约 12.95%
+的上下文回退也原样写入历史说明，不将它当成 ID 错误，不直接归因于 W&B。
+逐次 JSON/CSV/Table 记录前后 UTC 时间及整机 load average（不是本组 CPU 利用率）。
+一个 `bpe-task1-native-adapter-exploration` run 记录探索全部源码、候选和诊断快照；
+独立确认另建一个 `bpe-task1-plain-confirmation` run。上传异常与计算有效性分开记录。
+试验前后和上传结束后检查指纹；不自动更新 `dev`，不预先承诺低于 5 秒。
+
+本地仅执行小文本回归：
+
+```bash
+.venv/bin/python -m pytest -q tests/test_task1_native_adapter.py
+```
+
+测试会在临时目录构建小文本所需的本机扩展以模拟前阶段快照；云端探索入口本身
+只复用既有扩展，不运行编译器。
